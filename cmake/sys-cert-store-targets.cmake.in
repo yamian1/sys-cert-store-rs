@@ -1,0 +1,8 @@
+if(NOT TARGET sys-cert-store::sys-cert-store)
+    get_filename_component(_SCS_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../.." ABSOLUTE)
+    add_library(sys-cert-store::sys-cert-store SHARED IMPORTED)
+    set_target_properties(sys-cert-store::sys-cert-store PROPERTIES
+        IMPORTED_LOCATION "${_SCS_PREFIX}/@CMAKE_INSTALL_LIBDIR@/libsys-cert-store.so"
+        INTERFACE_INCLUDE_DIRECTORIES "${_SCS_PREFIX}/@CMAKE_INSTALL_INCLUDEDIR@")
+    unset(_SCS_PREFIX)
+endif()

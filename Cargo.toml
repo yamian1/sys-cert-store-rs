@@ -1,0 +1,38 @@
+[package]
+name = "sys-cert-store"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Rust implementation of the sys-cert-store Linux certificate store API"
+build = "build.rs"
+
+[lib]
+name = "sys_cert_store"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "certutil"
+path = "src/bin/certutil.rs"
+
+[dependencies]
+hex = "0.4"
+foreign-types-shared = "0.1"
+libc = "0.2"
+openssl = "0.10"
+openssl-sys = "0.9"
+parking_lot = "0.12"
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+sha1 = "0.10"
+sha2 = "0.10"
+x509-parser = "0.18"
+walkdir = "2"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"
