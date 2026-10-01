@@ -74,10 +74,7 @@ pub fn message_ptr() -> *const libc::c_char {
 }
 
 pub fn boundary<T: Copy>(failure: T, operation: impl FnOnce() -> Result<T, ApiError>) -> T {
-    match catch_unwind(AssertUnwindSafe(|| {
-        crate::crypto::initialize()?;
-        operation()
-    })) {
+    match catch_unwind(AssertUnwindSafe(operation)) {
         Ok(Ok(value)) => value,
         Ok(Err(error)) => {
             set_error(error.code, &error.message);

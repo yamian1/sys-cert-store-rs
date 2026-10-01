@@ -1,54 +1,184 @@
+use crate::crypto::{is_pqc_oid, verify_pqc_certificate};
 use crate::error::{ApiError, require};
 use crate::ffi::*;
-use foreign_types_shared::{ForeignType, ForeignTypeRef};
-use openssl::hash::{MessageDigest, hash};
-use openssl::pkey::{PKey, Private};
-use openssl::x509::{X509, X509NameRef};
-use openssl_sys as ossl;
+use crate::key::PrivateKey;
+use base64ct::{Base64, Encoding};
+use md5::Md5;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::ffi::CString;
-use std::ptr;
 use std::sync::Arc;
-
-#[repr(C)]
-struct X509PubkeyOpaque {
-    _private: [u8; 0],
-}
-
-unsafe extern "C" {
-    fn ASN1_TIME_to_tm(time: *const ossl::ASN1_TIME, value: *mut libc::tm) -> libc::c_int;
-    fn X509_get0_serialNumber(x509: *const ossl::X509) -> *const ossl::ASN1_INTEGER;
-    fn X509_get0_tbs_sigalg(x509: *const ossl::X509) -> *const ossl::X509_ALGOR;
-    fn X509_get0_notBefore(x509: *const ossl::X509) -> *const ossl::ASN1_TIME;
-    fn X509_get0_notAfter(x509: *const ossl::X509) -> *const ossl::ASN1_TIME;
-    fn X509_get_X509_PUBKEY(x509: *const ossl::X509) -> *mut X509PubkeyOpaque;
-    fn X509_PUBKEY_get0_param(
-        object: *mut *mut ossl::ASN1_OBJECT,
-        public_key: *mut *const u8,
-        public_key_length: *mut libc::c_int,
-        algorithm: *mut *mut ossl::X509_ALGOR,
-        pubkey: *mut X509PubkeyOpaque,
-    ) -> libc::c_int;
-    fn X509_get0_pubkey_bitstr(x509: *const ossl::X509) -> *const ossl::ASN1_BIT_STRING;
-    fn X509_get0_uids(
-        x509: *const ossl::X509,
-        issuer: *mut *const ossl::ASN1_BIT_STRING,
-        subject: *mut *const ossl::ASN1_BIT_STRING,
-    );
-}
+use x509_parser::extensions::ParsedExtension;
+use x509_parser::prelude::*;
 
 pub type Properties = BTreeMap<DWORD, Vec<u8>>;
+
+#[derive(Clone)]
+pub struct Certificate {
+    der: Vec<u8>,
+}
+
+impl Certificate {
+    pub fn from_der(der: &[u8]) -> Result<Self, ApiError> {
+        require(
+            !der.is_empty() && der.len() <= i32::MAX as usize,
+            ERROR_INVALID_DATA,
+            "Empty or oversized certificate",
+        )?;
+        let (remaining, _) = parse_x509_certificate(der)
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid DER certificate"))?;
+        require(
+            remaining.is_empty(),
+            ERROR_INVALID_DATA,
+            "Invalid DER certificate or trailing bytes",
+        )?;
+        Ok(Self { der: der.to_vec() })
+    }
+
+    pub fn from_pem(pem: &[u8]) -> Result<Self, ApiError> {
+        let (_, block) = parse_x509_pem(pem)
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid certificate PEM object"))?;
+        require(
+            block.label == "CERTIFICATE",
+            ERROR_INVALID_DATA,
+            "Invalid certificate PEM label",
+        )?;
+        Self::from_der(&block.contents)
+    }
+
+    fn parsed(&self) -> Result<X509Certificate<'_>, ApiError> {
+        parse_x509_certificate(&self.der)
+            .map(|(_, certificate)| certificate)
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid DER certificate"))
+    }
+
+    pub fn to_der(&self) -> Vec<u8> {
+        self.der.clone()
+    }
+
+    pub fn to_pem(&self) -> Vec<u8> {
+        let encoded = Base64::encode_string(&self.der);
+        let mut result = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            result.push_str(std::str::from_utf8(chunk).unwrap());
+            result.push('\n');
+        }
+        result.push_str("-----END CERTIFICATE-----\n");
+        result.into_bytes()
+    }
+
+    pub fn signature_oid(&self) -> Result<String, ApiError> {
+        Ok(self.parsed()?.signature_algorithm.algorithm.to_id_string())
+    }
+
+    pub fn public_key_oid(&self) -> Result<String, ApiError> {
+        Ok(self
+            .parsed()?
+            .public_key()
+            .algorithm
+            .algorithm
+            .to_id_string())
+    }
+
+    pub fn subject_raw(&self) -> Result<Vec<u8>, ApiError> {
+        Ok(self.parsed()?.subject().as_raw().to_vec())
+    }
+
+    pub fn issuer_raw(&self) -> Result<Vec<u8>, ApiError> {
+        Ok(self.parsed()?.issuer().as_raw().to_vec())
+    }
+
+    pub fn subject_text(&self) -> Result<String, ApiError> {
+        Ok(self.parsed()?.subject().to_string())
+    }
+
+    pub fn issuer_text(&self) -> Result<String, ApiError> {
+        Ok(self.parsed()?.issuer().to_string())
+    }
+
+    pub fn not_before_timestamp(&self) -> Result<i64, ApiError> {
+        Ok(self.parsed()?.validity().not_before.timestamp())
+    }
+
+    pub fn not_after_timestamp(&self) -> Result<i64, ApiError> {
+        Ok(self.parsed()?.validity().not_after.timestamp())
+    }
+
+    pub fn not_before_text(&self) -> Result<String, ApiError> {
+        Ok(self.parsed()?.validity().not_before.to_string())
+    }
+
+    pub fn not_after_text(&self) -> Result<String, ApiError> {
+        Ok(self.parsed()?.validity().not_after.to_string())
+    }
+
+    pub fn serial_hex(&self) -> Result<String, ApiError> {
+        let serial = self.parsed()?.raw_serial().to_vec();
+        let first = serial
+            .iter()
+            .position(|byte| *byte != 0)
+            .unwrap_or(serial.len().saturating_sub(1));
+        Ok(hex::encode(&serial[first..]))
+    }
+
+    pub fn sha1_fingerprint(&self) -> Vec<u8> {
+        Sha1::digest(&self.der).to_vec()
+    }
+
+    pub fn sha256_fingerprint(&self) -> Vec<u8> {
+        Sha256::digest(&self.der).to_vec()
+    }
+
+    pub fn subject_public_key_info(&self) -> Result<Vec<u8>, ApiError> {
+        Ok(self.parsed()?.public_key().raw.to_vec())
+    }
+
+    pub fn subject_key_identifier(&self) -> Result<Option<Vec<u8>>, ApiError> {
+        for extension in self.parsed()?.extensions() {
+            if let ParsedExtension::SubjectKeyIdentifier(identifier) = extension.parsed_extension()
+            {
+                return Ok(Some(identifier.0.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn is_ca(&self) -> Result<bool, ApiError> {
+        for extension in self.parsed()?.extensions() {
+            if let ParsedExtension::BasicConstraints(constraints) = extension.parsed_extension() {
+                return Ok(constraints.ca);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn verify_with(&self, issuer: &Certificate) -> Result<bool, ApiError> {
+        if is_pqc_oid(&self.signature_oid()?) {
+            return verify_pqc_certificate(&self.der, &issuer.der);
+        }
+        let certificate = self.parsed()?;
+        let issuer = issuer.parsed()?;
+        Ok(certificate
+            .verify_signature(Some(issuer.public_key()))
+            .is_ok())
+    }
+
+    pub fn self_signed(&self) -> Result<bool, ApiError> {
+        Ok(self.subject_raw()? == self.issuer_raw()? && self.verify_with(self)?)
+    }
+}
 
 pub struct Context {
     pub public: CERT_CONTEXT,
     pub info: CERT_INFO,
-    pub certificate: X509,
+    pub certificate: Certificate,
     pub der: Vec<u8>,
     buffers: Vec<Box<[u8]>>,
     strings: Vec<CString>,
     extensions: Vec<CERT_EXTENSION>,
     pub properties: Properties,
-    pub private_key: Option<Arc<PKey<Private>>>,
+    pub private_key: Option<Arc<PrivateKey>>,
     pub object_path: Option<std::path::PathBuf>,
     pub key_path: Option<std::path::PathBuf>,
     pub store_id: Option<usize>,
@@ -61,22 +191,7 @@ unsafe impl Send for Context {}
 
 impl Context {
     pub fn new(der: Vec<u8>) -> Result<Box<Self>, ApiError> {
-        require(
-            !der.is_empty() && der.len() <= i32::MAX as usize,
-            ERROR_INVALID_DATA,
-            "Empty or oversized certificate",
-        )?;
-        let certificate = X509::from_der(&der).map_err(|_| {
-            ApiError::new(
-                ERROR_INVALID_DATA,
-                "Invalid DER certificate or trailing bytes",
-            )
-        })?;
-        require(
-            certificate.to_der()? == der,
-            ERROR_INVALID_DATA,
-            "Invalid DER certificate or trailing bytes",
-        )?;
+        let certificate = Certificate::from_der(&der)?;
         let mut result = Box::new(Self {
             public: CERT_CONTEXT::default(),
             info: CERT_INFO::default(),
@@ -107,69 +222,31 @@ impl Context {
         }
     }
 
-    fn oid(&mut self, object: *const ossl::ASN1_OBJECT) -> Result<*mut libc::c_char, ApiError> {
-        let length = unsafe { ossl::OBJ_obj2txt(ptr::null_mut(), 0, object, 1) };
-        require(length > 0, ERROR_INVALID_DATA, "Invalid object identifier")?;
-        let mut bytes = vec![0u8; length as usize + 1];
-        unsafe { ossl::OBJ_obj2txt(bytes.as_mut_ptr().cast(), bytes.len() as i32, object, 1) };
-        let value = CString::from_vec_with_nul(bytes)
+    fn oid(&mut self, value: String) -> Result<*mut libc::c_char, ApiError> {
+        let value = CString::new(value)
             .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid object identifier"))?;
         self.strings.push(value);
         Ok(self.strings.last().unwrap().as_ptr().cast_mut())
     }
 
-    fn algorithm(
-        &mut self,
-        algorithm: *const ossl::X509_ALGOR,
-    ) -> Result<CRYPT_ALGORITHM_IDENTIFIER, ApiError> {
-        let mut object = ptr::null();
-        unsafe { ossl::X509_ALGOR_get0(&mut object, ptr::null_mut(), ptr::null_mut(), algorithm) };
+    fn algorithm(&mut self, oid: String) -> Result<CRYPT_ALGORITHM_IDENTIFIER, ApiError> {
         Ok(CRYPT_ALGORITHM_IDENTIFIER {
-            pszObjId: self.oid(object)?,
+            pszObjId: self.oid(oid)?,
             Parameters: CRYPT_DATA_BLOB::default(),
         })
     }
 
-    fn bit_blob(&mut self, bits: *const ossl::ASN1_BIT_STRING) -> CRYPT_BIT_BLOB {
-        if bits.is_null() {
-            return CRYPT_BIT_BLOB::default();
-        }
-        let size = unsafe { ossl::ASN1_STRING_length(bits.cast()) }.max(0) as usize;
-        let data = unsafe { ossl::ASN1_STRING_get0_data(bits.cast()) };
-        let value = if size == 0 {
-            Vec::new()
-        } else {
-            unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
-        };
-        let blob = self.keep(value);
+    fn bit_blob(&mut self, data: &[u8], unused_bits: u8) -> CRYPT_BIT_BLOB {
+        let blob = self.keep(data.to_vec());
         CRYPT_BIT_BLOB {
             cbData: blob.cbData,
             pbData: blob.pbData,
-            cUnusedBits: 0,
+            cUnusedBits: unused_bits as DWORD,
         }
     }
 
-    fn name_der(&mut self, name: *const ossl::X509_NAME) -> Result<CRYPT_DATA_BLOB, ApiError> {
-        let size = unsafe { ossl::i2d_X509_NAME(name, ptr::null_mut()) };
-        require(size > 0, ERROR_INVALID_DATA, "ASN.1 encoding failed")?;
-        let mut bytes = vec![0u8; size as usize];
-        let mut cursor = bytes.as_mut_ptr();
-        require(
-            unsafe { ossl::i2d_X509_NAME(name, &mut cursor) } == size,
-            ERROR_INVALID_DATA,
-            "ASN.1 encoding failed",
-        )?;
-        Ok(self.keep(bytes))
-    }
-
-    fn filetime(time: *const ossl::ASN1_TIME) -> Result<FILETIME, ApiError> {
-        let mut value: libc::tm = unsafe { std::mem::zeroed() };
-        require(
-            unsafe { ASN1_TIME_to_tm(time, &mut value) } == 1,
-            ERROR_INVALID_DATA,
-            "Invalid certificate validity time",
-        )?;
-        let seconds = unsafe { libc::timegm(&mut value) } as i64 + 11_644_473_600;
+    fn filetime(timestamp: i64) -> Result<FILETIME, ApiError> {
+        let seconds = timestamp + 11_644_473_600;
         require(
             seconds >= 0,
             ERROR_NOT_SUPPORTED,
@@ -183,66 +260,90 @@ impl Context {
     }
 
     fn populate(&mut self) -> Result<(), ApiError> {
-        let x = self.certificate.as_ptr();
-        self.info.dwVersion = unsafe { ossl::X509_get_version(x) } as DWORD;
+        let (
+            version,
+            serial,
+            signature_oid,
+            issuer,
+            subject,
+            not_before,
+            not_after,
+            public_key_oid,
+            public_key,
+            public_key_unused_bits,
+            issuer_uid,
+            subject_uid,
+            extensions,
+        ) = {
+            let certificate = self.certificate.parsed()?;
+            (
+                certificate.version().0 as DWORD,
+                certificate.raw_serial().to_vec(),
+                certificate.signature_algorithm.algorithm.to_id_string(),
+                certificate.issuer().as_raw().to_vec(),
+                certificate.subject().as_raw().to_vec(),
+                certificate.validity().not_before.timestamp(),
+                certificate.validity().not_after.timestamp(),
+                certificate.public_key().algorithm.algorithm.to_id_string(),
+                certificate.public_key().subject_public_key.data.to_vec(),
+                certificate.public_key().subject_public_key.unused_bits,
+                certificate
+                    .tbs_certificate
+                    .issuer_uid
+                    .as_ref()
+                    .map(|value| (value.0.data.to_vec(), value.0.unused_bits)),
+                certificate
+                    .tbs_certificate
+                    .subject_uid
+                    .as_ref()
+                    .map(|value| (value.0.data.to_vec(), value.0.unused_bits)),
+                certificate
+                    .extensions()
+                    .iter()
+                    .map(|extension| {
+                        (
+                            extension.oid.to_id_string(),
+                            extension.critical,
+                            extension.value.to_vec(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        self.info.dwVersion = version;
 
-        let serial = unsafe { X509_get0_serialNumber(x) };
-        let serial_type = unsafe { ossl::ASN1_STRING_type(serial.cast()) };
         require(
-            serial_type != (ossl::V_ASN1_INTEGER | 0x100),
+            serial.first().is_none_or(|byte| byte & 0x80 == 0),
             ERROR_NOT_SUPPORTED,
             "Negative certificate serial numbers are unsupported",
         )?;
-        let serial_size = unsafe { ossl::ASN1_STRING_length(serial.cast()) }.max(0) as usize;
-        let serial_data = unsafe { ossl::ASN1_STRING_get0_data(serial.cast()) };
-        let mut serial_bytes =
-            unsafe { std::slice::from_raw_parts(serial_data, serial_size) }.to_vec();
+        let mut serial_bytes = serial;
         serial_bytes.reverse();
         self.info.SerialNumber = self.keep(serial_bytes);
 
-        self.info.SignatureAlgorithm = self.algorithm(unsafe { X509_get0_tbs_sigalg(x) })?;
-        self.info.Issuer = self.name_der(unsafe { ossl::X509_get_issuer_name(x) })?;
-        self.info.Subject = self.name_der(unsafe { ossl::X509_get_subject_name(x) })?;
-        self.info.NotBefore = Self::filetime(unsafe { X509_get0_notBefore(x) })?;
-        self.info.NotAfter = Self::filetime(unsafe { X509_get0_notAfter(x) })?;
+        self.info.SignatureAlgorithm = self.algorithm(signature_oid)?;
+        self.info.Issuer = self.keep(issuer);
+        self.info.Subject = self.keep(subject);
+        self.info.NotBefore = Self::filetime(not_before)?;
+        self.info.NotAfter = Self::filetime(not_after)?;
 
-        let public = unsafe { X509_get_X509_PUBKEY(x) };
-        let mut algorithm = ptr::null_mut();
-        require(
-            unsafe {
-                X509_PUBKEY_get0_param(
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    &mut algorithm,
-                    public,
-                )
-            } == 1,
-            ERROR_INVALID_DATA,
-            "Invalid certificate public key",
-        )?;
-        self.info.SubjectPublicKeyInfo.Algorithm = self.algorithm(algorithm)?;
+        self.info.SubjectPublicKeyInfo.Algorithm = self.algorithm(public_key_oid)?;
         self.info.SubjectPublicKeyInfo.PublicKey =
-            self.bit_blob(unsafe { X509_get0_pubkey_bitstr(x) });
+            self.bit_blob(&public_key, public_key_unused_bits);
 
-        let mut issuer_id = ptr::null();
-        let mut subject_id = ptr::null();
-        unsafe { X509_get0_uids(x, &mut issuer_id, &mut subject_id) };
-        self.info.IssuerUniqueId = self.bit_blob(issuer_id);
-        self.info.SubjectUniqueId = self.bit_blob(subject_id);
+        if let Some((data, unused_bits)) = issuer_uid {
+            self.info.IssuerUniqueId = self.bit_blob(&data, unused_bits);
+        }
+        if let Some((data, unused_bits)) = subject_uid {
+            self.info.SubjectUniqueId = self.bit_blob(&data, unused_bits);
+        }
 
-        let count = unsafe { ossl::X509_get_ext_count(x) };
-        for index in 0..count {
-            let extension = unsafe { ossl::X509_get_ext(x, index) };
-            let data = unsafe { ossl::X509_EXTENSION_get_data(extension) };
-            let size = unsafe { ossl::ASN1_STRING_length(data.cast()) }.max(0) as usize;
-            let pointer = unsafe { ossl::ASN1_STRING_get0_data(data.cast()) };
-            let value = unsafe { std::slice::from_raw_parts(pointer, size) }.to_vec();
+        for (extension_oid, critical, value) in extensions {
             let blob = self.keep(value);
-            let oid = self.oid(unsafe { ossl::X509_EXTENSION_get_object(extension) })?;
+            let oid = self.oid(extension_oid)?;
             self.extensions.push(CERT_EXTENSION {
                 pszObjId: oid,
-                fCritical: unsafe { ossl::X509_EXTENSION_get_critical(extension) },
+                fCritical: bool_value(critical),
                 Value: blob,
             });
         }
@@ -280,16 +381,12 @@ impl Context {
         self.issuer_der() == other.issuer_der() && self.serial_le() == other.serial_le()
     }
 
-    pub fn simple_name(name: &X509NameRef) -> String {
-        name.entries()
-            .map(|entry| {
-                entry
-                    .data()
-                    .to_string()
-                    .unwrap_or_else(|_| "<invalid>".into())
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+    pub fn simple_name(certificate: &Certificate, subject: bool) -> Result<String, ApiError> {
+        if subject {
+            certificate.subject_text()
+        } else {
+            certificate.issuer_text()
+        }
     }
 
     pub fn property_value(&self, property: DWORD) -> Result<Vec<u8>, ApiError> {
@@ -301,24 +398,17 @@ impl Context {
         if let Some(value) = self.properties.get(&property) {
             return Ok(value.clone());
         }
-        let digest = match property {
-            CERT_SHA1_HASH_PROP_ID => Some(MessageDigest::sha1()),
-            CERT_SHA256_HASH_PROP_ID => Some(MessageDigest::sha256()),
-            CERT_MD5_HASH_PROP_ID => Some(MessageDigest::md5()),
-            _ => None,
-        };
-        if let Some(digest) = digest {
-            return Ok(hash(digest, &self.der)?.to_vec());
+        match property {
+            CERT_SHA1_HASH_PROP_ID => return Ok(Sha1::digest(&self.der).to_vec()),
+            CERT_SHA256_HASH_PROP_ID => return Ok(Sha256::digest(&self.der).to_vec()),
+            CERT_MD5_HASH_PROP_ID => return Ok(Md5::digest(&self.der).to_vec()),
+            _ => {}
         }
         if property == CERT_KEY_IDENTIFIER_PROP_ID {
-            if let Some(identifier) = self.certificate.subject_key_id() {
-                return Ok(identifier.as_slice().to_vec());
+            if let Some(identifier) = self.certificate.subject_key_identifier()? {
+                return Ok(identifier);
             }
-            return Ok(hash(
-                MessageDigest::sha1(),
-                &self.certificate.public_key()?.public_key_to_der()?,
-            )?
-            .to_vec());
+            return Ok(Sha1::digest(self.certificate.subject_public_key_info()?).to_vec());
         }
         Err(ApiError::new(
             CRYPT_E_NOT_FOUND,
@@ -338,8 +428,4 @@ pub fn supported_property(property: DWORD) -> bool {
             | CERT_SHA256_HASH_PROP_ID
             | CERT_MD5_HASH_PROP_ID
     ) || (CERT_FIRST_USER_PROP_ID..=CERT_LAST_USER_PROP_ID).contains(&property)
-}
-
-pub fn names_equal(left: &X509NameRef, right: &X509NameRef) -> bool {
-    unsafe { ossl::X509_NAME_cmp(left.as_ptr(), right.as_ptr()) == 0 }
 }

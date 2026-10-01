@@ -1,22 +1,24 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-mod cert;
+pub mod cert;
 mod crypto;
 mod error;
 pub mod ffi;
+pub mod key;
 mod native;
 mod store;
 
-use crate::cert::{Context, names_equal, supported_property};
+use crate::cert::{Context, supported_property};
 use crate::error::{ApiError, boundary, last_error, message_ptr, require, set_error};
 use crate::ffi::*;
+use crate::key::PrivateKey;
 use crate::native::{native_layout, remove_trusted_certificate, update_anchor};
 use crate::store::*;
-use foreign_types_shared::ForeignType;
+use cms::content_info::ContentInfo;
+use der::{Decode, Encode};
 use libc::{c_char, c_void};
 use openssl::pkcs12::Pkcs12;
-use openssl::x509::X509Name;
-use openssl_sys as ossl;
+use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
 use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 use std::ffi::CStr;
@@ -24,6 +26,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
+use x509_parser::prelude::{FromDer, X509Name as NativeX509Name};
 use zeroize::Zeroize;
 
 fn encoding_check(encoding: DWORD) -> Result<(), ApiError> {
@@ -225,17 +228,17 @@ fn blob_slice(blob: &CRYPT_DATA_BLOB) -> Result<&[u8], ApiError> {
     })
 }
 
-fn encoded_name(blob: &CRYPT_DATA_BLOB) -> Result<X509Name, ApiError> {
+fn encoded_name(blob: &CRYPT_DATA_BLOB) -> Result<Vec<u8>, ApiError> {
     let data = blob_slice(blob)?;
-    let mut cursor = data.as_ptr();
-    let name =
-        unsafe { ossl::d2i_X509_NAME(ptr::null_mut(), &mut cursor, data.len() as libc::c_long) };
+    let parsed = NativeX509Name::from_der(data);
     require(
-        !name.is_null() && cursor == unsafe { data.as_ptr().add(data.len()) },
+        parsed
+            .as_ref()
+            .is_ok_and(|(remaining, _)| remaining.is_empty()),
         ERROR_INVALID_DATA,
         "Invalid encoded distinguished name",
     )?;
-    Ok(unsafe { X509Name::from_ptr(name) })
+    Ok(data.to_vec())
 }
 
 fn context_matches(
@@ -254,27 +257,21 @@ fn context_matches(
             let information = unsafe { &*(parameter.cast::<CERT_INFO>()) };
             Ok(
                 blob_slice(&candidate.info.SerialNumber)? == blob_slice(&information.SerialNumber)?
-                    && names_equal(
-                        candidate.certificate.issuer_name(),
-                        encoded_name(&information.Issuer)?.as_ref(),
-                    ),
+                    && candidate.certificate.issuer_raw()? == encoded_name(&information.Issuer)?,
             )
         }
         CERT_FIND_ISSUER_OF => {
             let subject = state.context(parameter.cast())?;
-            Ok(names_equal(
-                candidate.certificate.subject_name(),
-                subject.certificate.issuer_name(),
-            ))
+            Ok(candidate.certificate.subject_raw()? == subject.certificate.issuer_raw()?)
         }
         CERT_FIND_SUBJECT_NAME | CERT_FIND_ISSUER_NAME => {
             let name = encoded_name(unsafe { &*(parameter.cast::<CRYPT_DATA_BLOB>()) })?;
             let candidate_name = if kind == CERT_FIND_SUBJECT_NAME {
-                candidate.certificate.subject_name()
+                candidate.certificate.subject_raw()?
             } else {
-                candidate.certificate.issuer_name()
+                candidate.certificate.issuer_raw()?
             };
-            Ok(names_equal(candidate_name, name.as_ref()))
+            Ok(candidate_name == name)
         }
         CERT_FIND_SUBJECT_STR_A
         | CERT_FIND_SUBJECT_STR_W
@@ -289,11 +286,7 @@ fn context_matches(
                     .to_string_lossy()
                     .into_owned()
             };
-            let haystack = Context::simple_name(if subject {
-                candidate.certificate.subject_name()
-            } else {
-                candidate.certificate.issuer_name()
-            });
+            let haystack = Context::simple_name(&candidate.certificate, subject)?;
             Ok(haystack
                 .to_ascii_lowercase()
                 .contains(&needle.to_ascii_lowercase()))
@@ -535,11 +528,8 @@ fn add_context(
                 || disposition == CERT_STORE_ADD_NEWER_INHERIT_PROPERTIES)
         {
             require(
-                source
-                    .certificate
-                    .not_before()
-                    .compare(old.certificate.not_before())?
-                    == std::cmp::Ordering::Greater,
+                source.certificate.not_before_timestamp()?
+                    > old.certificate.not_before_timestamp()?,
                 CRYPT_E_EXISTS,
                 "Existing certificate is not older",
             )?;
@@ -685,6 +675,42 @@ fn delete_context(state: &mut State, pointer: *const CERT_CONTEXT) -> Result<(),
 }
 
 #[allow(clippy::vec_box)]
+fn parse_pfx_openssl(data: &[u8], secret: &str) -> Result<Vec<Box<Context>>, ApiError> {
+    let pfx = Pkcs12::from_der(data).map_err(|_| {
+        ApiError::new(
+            ERROR_INVALID_DATA,
+            "Invalid PKCS#12 encoding or trailing bytes",
+        )
+    })?;
+    let parsed = pfx.parse2(secret).map_err(|_| {
+        ApiError::new(
+            ERROR_INVALID_DATA,
+            "PKCS#12 password or integrity check failed",
+        )
+    })?;
+    let mut result = Vec::new();
+    if let Some(certificate) = parsed.cert {
+        let mut context = Context::new(certificate.to_der()?)?;
+        if let Some(key) = parsed.pkey {
+            let key = PrivateKey::from_der(key.private_key_to_pkcs8()?)?;
+            require(
+                key.matches(&context.certificate)?,
+                ERROR_INVALID_DATA,
+                "PKCS#12 key has no matching certificate",
+            )?;
+            context.private_key = Some(Arc::new(key));
+        }
+        result.push(context);
+    }
+    if let Some(chain) = parsed.ca {
+        for certificate in chain {
+            result.push(Context::new(certificate.to_der()?)?);
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::vec_box)]
 fn parse_pfx(
     blob: &CRYPT_DATA_BLOB,
     password: LPCWSTR,
@@ -707,35 +733,72 @@ fn parse_pfx(
     } else {
         unsafe { wide_string(password) }?
     };
-    let pfx = Pkcs12::from_der(data).map_err(|_| {
+    let keystore = KeyStore::from_pkcs12(data, &secret, Pkcs12ImportPolicy::Raw).map_err(|_| {
         ApiError::new(
             ERROR_INVALID_DATA,
-            "Invalid PKCS#12 encoding or trailing bytes",
+            "PKCS#12 password or integrity check failed",
         )
     })?;
-    let parsed = pfx.parse2(&secret).map_err(|_| {
+    let keys = KeyStore::from_pkcs12(data, &secret, Pkcs12ImportPolicy::Relaxed).map_err(|_| {
         ApiError::new(
             ERROR_INVALID_DATA,
             "PKCS#12 password or integrity check failed",
         )
     })?;
     let mut result = Vec::new();
-    if let Some(certificate) = parsed.cert {
-        let mut context = Context::new(certificate.to_der()?)?;
-        if let Some(key) = parsed.pkey {
+    let mut private_key = None;
+    let mut requires_openssl = false;
+    for (_, entry) in keys.entries() {
+        if let KeyStoreEntry::PrivateKeyChain(chain) = entry {
+            let key = PrivateKey::from_der(chain.key().as_der().to_vec())?;
+            requires_openssl |= key.is_pqc();
             require(
-                certificate.public_key()?.public_eq(&key),
-                ERROR_INVALID_DATA,
-                "PKCS#12 key has no matching certificate",
+                private_key.is_none(),
+                ERROR_NOT_SUPPORTED,
+                "PKCS#12 files with multiple private keys are unsupported",
             )?;
-            context.private_key = Some(Arc::new(key));
+            private_key = Some(key);
         }
-        result.push(context);
     }
-    if let Some(chain) = parsed.ca {
-        for certificate in chain {
-            result.push(Context::new(certificate.to_der()?)?);
+    for (_, entry) in keystore.entries() {
+        match entry {
+            KeyStoreEntry::PrivateKeyChain(_) => {}
+            KeyStoreEntry::Certificate(certificate) => {
+                let context = Context::new(certificate.as_der().to_vec())?;
+                requires_openssl |=
+                    crate::crypto::is_pqc_oid(&context.certificate.public_key_oid()?)
+                        || crate::crypto::is_pqc_oid(&context.certificate.signature_oid()?);
+                result.push(context);
+            }
+            KeyStoreEntry::Secret(_) => {
+                return Err(ApiError::new(
+                    ERROR_NOT_SUPPORTED,
+                    "PKCS#12 secret bags are unsupported",
+                ));
+            }
         }
+    }
+    if requires_openssl {
+        result = parse_pfx_openssl(data, &secret)?;
+    } else if let Some(key) = private_key {
+        let matches = result
+            .iter()
+            .enumerate()
+            .filter_map(|(index, context)| {
+                key.matches(&context.certificate)
+                    .ok()
+                    .filter(|matched| *matched)
+                    .map(|_| index)
+            })
+            .collect::<Vec<_>>();
+        require(
+            matches.len() == 1,
+            ERROR_INVALID_DATA,
+            "PKCS#12 key has no unique matching certificate",
+        )?;
+        let mut leaf = result.remove(matches[0]);
+        leaf.private_key = Some(Arc::new(key));
+        result.insert(0, leaf);
     }
     secret.zeroize();
     require(
@@ -1055,9 +1118,8 @@ pub extern "C" fn CertGetIssuerCertificateFromStore(
             let state = STATE.lock();
             state.context(subject)?.certificate.clone()
         };
-        let key = source.public_key()?;
         require(
-            !(names_equal(source.subject_name(), source.issuer_name()) && source.verify(&key)?),
+            !source.self_signed()?,
             CRYPT_E_SELF_SIGNED,
             "Subject is self-signed",
         )?;
@@ -1073,16 +1135,16 @@ pub extern "C" fn CertGetIssuerCertificateFromStore(
             state.context(result)?.certificate.clone()
         };
         let mut remaining = requested;
-        if remaining & CERT_STORE_SIGNATURE_FLAG != 0 {
-            let issuer_key = issuer.public_key()?;
-            if source.verify(&issuer_key)? {
-                remaining &= !CERT_STORE_SIGNATURE_FLAG;
-            }
+        if remaining & CERT_STORE_SIGNATURE_FLAG != 0 && source.verify_with(&issuer)? {
+            remaining &= !CERT_STORE_SIGNATURE_FLAG;
         }
-        let now = openssl::asn1::Asn1Time::days_from_now(0)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| ApiError::new(ERROR_GEN_FAILURE, "System time predates Unix epoch"))?
+            .as_secs() as i64;
         if remaining & CERT_STORE_TIME_VALIDITY_FLAG != 0
-            && source.not_before().compare(&now)? == std::cmp::Ordering::Less
-            && source.not_after().compare(&now)? == std::cmp::Ordering::Greater
+            && source.not_before_timestamp()? < now
+            && source.not_after_timestamp()? > now
         {
             remaining &= !CERT_STORE_TIME_VALIDITY_FLAG;
         }
@@ -1465,54 +1527,37 @@ pub extern "C" fn CertSaveStore(
                     .collect::<Result<Vec<_>, _>>()?;
                 drop(statement);
                 for row in rows {
-                    certificates.push(load_context(store, row)?.certificate);
+                    certificates.push(load_context(store, row)?.der);
                 }
             }
             certificates
         };
+        let certificates = certificates
+            .iter()
+            .map(|certificate| {
+                x509_cert::Certificate::from_der(certificate).map_err(|error| {
+                    ApiError::new(
+                        ERROR_INVALID_DATA,
+                        format!("Cannot decode certificate for PKCS#7: {error}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let message = ContentInfo::try_from(certificates).map_err(|error| {
+            ApiError::new(
+                ERROR_GEN_FAILURE,
+                format!("Cannot create PKCS#7 container: {error}"),
+            )
+        })?;
+        let encoded = message.to_der().map_err(|error| {
+            ApiError::new(
+                ERROR_GEN_FAILURE,
+                format!("Cannot encode PKCS#7 container: {error}"),
+            )
+        })?;
         unsafe {
-            let message = ossl::PKCS7_new();
-            require(
-                !message.is_null(),
-                ERROR_GEN_FAILURE,
-                "Cannot create PKCS#7 container",
-            )?;
-            struct Guard(*mut ossl::PKCS7);
-            impl Drop for Guard {
-                fn drop(&mut self) {
-                    unsafe { ossl::PKCS7_free(self.0) }
-                }
-            }
-            let guard = Guard(message);
-            require(
-                ossl::PKCS7_set_type(message, ossl::NID_pkcs7_signed) == 1,
-                ERROR_GEN_FAILURE,
-                "Cannot create PKCS#7 container",
-            )?;
-            require(
-                ossl::PKCS7_content_new(message, ossl::NID_pkcs7_data) == 1,
-                ERROR_GEN_FAILURE,
-                "Cannot create PKCS#7 container",
-            )?;
-            for certificate in &certificates {
-                require(
-                    ossl::PKCS7_add_certificate(message, certificate.as_ptr()) == 1,
-                    ERROR_GEN_FAILURE,
-                    "Cannot add certificate to PKCS#7 container",
-                )?;
-            }
-            let size = ossl::i2d_PKCS7(message, ptr::null_mut());
-            require(size > 0, ERROR_GEN_FAILURE, "PKCS#7 encoding failed")?;
-            let mut encoded = vec![0u8; size as usize];
-            let mut cursor = encoded.as_mut_ptr();
-            require(
-                ossl::i2d_PKCS7(message, &mut cursor) == size,
-                ERROR_GEN_FAILURE,
-                "PKCS#7 encoding failed",
-            )?;
             let output = &mut *(parameter.cast::<CRYPT_DATA_BLOB>());
             copy_out(&encoded, output.pbData.cast(), &mut output.cbData)?;
-            drop(guard);
         }
         Ok(TRUE)
     })

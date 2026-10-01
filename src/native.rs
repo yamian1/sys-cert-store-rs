@@ -1,19 +1,13 @@
+use crate::cert::Certificate;
 use crate::error::{ApiError, require};
 use crate::ffi::*;
-use foreign_types_shared::ForeignTypeRef;
-use openssl::hash::{MessageDigest, hash};
-use openssl::x509::{X509, X509Ref};
-use openssl_sys as ossl;
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
-
-unsafe extern "C" {
-    fn X509_check_ca(certificate: *const ossl::X509) -> libc::c_int;
-}
 
 #[derive(Clone, Debug)]
 pub struct NativeLayout {
@@ -134,13 +128,13 @@ pub fn read_native(layout: &NativeLayout) -> Result<Vec<Vec<u8>>, ApiError> {
                 )
             })?;
         let end = stop + END.len();
-        let certificate = X509::from_pem(&text.as_bytes()[start..end]).map_err(|_| {
+        let certificate = Certificate::from_pem(&text.as_bytes()[start..end]).map_err(|_| {
             ApiError::new(
                 ERROR_INVALID_DATA,
                 "Invalid certificate in native trust bundle",
             )
         })?;
-        let der = certificate.to_der()?;
+        let der = certificate.to_der();
         if seen.insert(der.clone()) {
             result.push(der);
         }
@@ -149,10 +143,10 @@ pub fn read_native(layout: &NativeLayout) -> Result<Vec<Vec<u8>>, ApiError> {
     Ok(result)
 }
 
-fn anchor_name(certificate: &X509Ref) -> Result<String, ApiError> {
+fn anchor_name(certificate: &Certificate) -> Result<String, ApiError> {
     Ok(format!(
         "sys-cert-store-{}.crt",
-        hex::encode(hash(MessageDigest::sha256(), &certificate.to_der()?)?)
+        hex::encode(Sha256::digest(certificate.to_der()))
     ))
 }
 
@@ -165,14 +159,14 @@ fn blocklist_directory(layout: &NativeLayout) -> PathBuf {
     }
 }
 
-fn mutation_check(certificate: &X509Ref) -> Result<(), ApiError> {
+fn mutation_check(certificate: &Certificate) -> Result<(), ApiError> {
     require(
         unsafe { libc::getuid() == libc::geteuid() && libc::getgid() == libc::getegid() },
         ERROR_ACCESS_DENIED,
         "Trust updates are disabled in set-ID processes",
     )?;
     require(
-        unsafe { X509_check_ca(certificate.as_ptr()) } > 0,
+        certificate.is_ca()?,
         E_INVALIDARG,
         "Only CA certificates can be installed as trust anchors",
     )
@@ -239,7 +233,7 @@ fn write_replacement(path: &Path, data: &[u8], mode: u32) -> Result<(), ApiError
 fn apply_changes(
     layout: &NativeLayout,
     changes: Vec<Change>,
-    certificate: &X509Ref,
+    certificate: &Certificate,
     installed: bool,
 ) -> Result<(), ApiError> {
     require(
@@ -293,7 +287,7 @@ fn apply_changes(
             applied += 1;
         }
         run_updater(layout)?;
-        let expected = certificate.to_der()?;
+        let expected = certificate.to_der();
         let present = read_native(layout)?.iter().any(|value| value == &expected);
         require(
             present == installed,
@@ -330,15 +324,41 @@ fn apply_changes(
     Ok(())
 }
 
+fn pem_certificates(data: &[u8]) -> Result<Vec<Certificate>, ApiError> {
+    const BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
+    const END: &[u8] = b"-----END CERTIFICATE-----";
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while let Some(relative_start) = data[offset..]
+        .windows(BEGIN.len())
+        .position(|value| value == BEGIN)
+    {
+        let start = offset + relative_start;
+        let body = start + BEGIN.len();
+        let relative_end = data[body..]
+            .windows(END.len())
+            .position(|value| value == END)
+            .ok_or_else(|| ApiError::new(ERROR_INVALID_DATA, "Truncated certificate PEM"))?;
+        let end = body + relative_end + END.len();
+        result.push(Certificate::from_pem(&data[start..end])?);
+        offset = end;
+    }
+    require(
+        !result.is_empty(),
+        ERROR_INVALID_DATA,
+        "Invalid trust source",
+    )?;
+    Ok(result)
+}
+
 fn contains_certificate(path: &Path, expected: &[u8]) -> Result<bool, ApiError> {
     let text = fs::read(path)?;
     let marker = b"-----BEGIN CERTIFICATE-----";
     if !text.windows(marker.len()).any(|value| value == marker) {
         return Ok(false);
     }
-    let certificates = X509::stack_from_pem(&text)
-        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid trust source"))?;
-    if certificates.is_empty() || certificates[0].to_der()? != expected {
+    let certificates = pem_certificates(&text)?;
+    if certificates[0].to_der() != expected {
         return Ok(false);
     }
     require(
@@ -350,7 +370,7 @@ fn contains_certificate(path: &Path, expected: &[u8]) -> Result<bool, ApiError> 
 }
 
 pub fn update_anchor(
-    certificate: &X509Ref,
+    certificate: &Certificate,
     install: bool,
     layout: &NativeLayout,
 ) -> Result<(), ApiError> {
@@ -360,7 +380,7 @@ pub fn update_anchor(
     }
     let addition = change(
         layout.anchors.join(anchor_name(certificate)?),
-        Some(certificate.to_pem()?),
+        Some(certificate.to_pem()),
     )?;
     require(
         addition.before.is_none(),
@@ -381,11 +401,11 @@ pub fn update_anchor(
 }
 
 pub fn remove_trusted_certificate(
-    certificate: &X509Ref,
+    certificate: &Certificate,
     layout: &NativeLayout,
 ) -> Result<(), ApiError> {
     mutation_check(certificate)?;
-    let expected = certificate.to_der()?;
+    let expected = certificate.to_der();
     let mut changes = Vec::new();
     if layout.anchors.exists() {
         for entry in WalkDir::new(&layout.anchors).follow_links(false) {
@@ -440,7 +460,7 @@ pub fn remove_trusted_certificate(
         fs::create_dir_all(&directory)?;
         let blocked = change(
             directory.join(anchor_name(certificate)?),
-            Some(certificate.to_pem()?),
+            Some(certificate.to_pem()),
         )?;
         if let Some(before) = &blocked.before {
             require(

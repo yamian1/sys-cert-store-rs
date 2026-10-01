@@ -29,11 +29,13 @@ stack as the C++ implementation:
 - C SymCrypt for the provider's native cryptographic operations
 - hidden crypto symbols and no dynamic OpenSSL, SCOSSL, or SymCrypt dependency
 
-The Rust store, ABI, SQLite/filesystem persistence, native-trust integration,
-and CLI call OpenSSL through the Rust `openssl` bindings. The built-in
-`symcryptprovider` supplies ML-DSA and composite ML-DSA/ECDSA operations.
-SymCRust is not used because its current public surface does not implement
-ML-DSA or the required composite algorithms.
+Rust-native crates handle X.509 parsing and classical signature verification,
+PKCS#8 key parsing and public-key derivation, PKCS#12 import/export, PKCS#7/CMS
+certificate containers, hashing, persistence, native-trust integration, and
+the CLI. OpenSSL is selected only after an ML-DSA or composite ML-DSA OID is
+detected; its built-in `symcryptprovider` then supplies those operations
+through patched SCOSSL and C SymCrypt. SymCRust is not used because its current
+public surface does not implement ML-DSA or the required composite algorithms.
 
 Supported PQC signature algorithms are:
 

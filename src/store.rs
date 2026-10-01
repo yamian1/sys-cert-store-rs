@@ -1,9 +1,8 @@
-use crate::cert::{Context, Properties};
+use crate::cert::{Certificate, Context, Properties};
 use crate::error::{ApiError, require};
 use crate::ffi::*;
+use crate::key::PrivateKey;
 use crate::native::{NativeLayout, native_layout, read_native};
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
 use parking_lot::Mutex;
 use rand::RngCore;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -18,7 +17,7 @@ use std::sync::{Arc, LazyLock};
 #[derive(Clone)]
 pub struct Material {
     pub der: Vec<u8>,
-    pub key: Option<Arc<PKey<Private>>>,
+    pub key: Option<Arc<PrivateKey>>,
 }
 
 pub struct Store {
@@ -662,12 +661,12 @@ fn create_object(store: &Store, source: &Context) -> Result<String, ApiError> {
     )?;
     write_material(
         &directory.join("certificate.pem"),
-        &source.certificate.to_pem()?,
+        &source.certificate.to_pem(),
         store.public_material,
     )?;
     if let Some(key) = &source.private_key {
         require(
-            source.certificate.public_key()?.public_eq(key.as_ref()),
+            key.matches(&source.certificate)?,
             ERROR_INVALID_DATA,
             "Private key does not match certificate",
         )?;
@@ -679,11 +678,7 @@ fn create_object(store: &Store, source: &Context) -> Result<String, ApiError> {
         } else {
             directory.clone()
         };
-        write_material(
-            &key_directory.join("private-key.pem"),
-            &key.private_key_to_pem_pkcs8()?,
-            false,
-        )?;
+        write_material(&key_directory.join("private-key.pem"), &key.to_pem(), false)?;
     }
     Ok(id)
 }
@@ -716,9 +711,8 @@ pub fn load_context(store: &Store, row: i64) -> Result<Box<Context>, ApiError> {
         "Unsafe certificate object directory",
     )?;
     let pem = fs::read(directory.join("certificate.pem"))?;
-    let certificate = X509::from_pem(&pem)
-        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid certificate PEM object"))?;
-    let mut context = Context::new(certificate.to_der()?)?;
+    let certificate = Certificate::from_pem(&pem)?;
+    let mut context = Context::new(certificate.to_der())?;
     context.object_path = Some(directory.clone());
     let protected = directory.join("keys/private-key.pem");
     let local = directory.join("private-key.pem");
@@ -735,10 +729,9 @@ pub fn load_private_key(context: &mut Context) -> Result<(), ApiError> {
         return Ok(());
     }
     let pem = fs::read(context.key_path.as_ref().unwrap())?;
-    let key = PKey::private_key_from_pem(&pem)
-        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 private-key object"))?;
+    let key = PrivateKey::from_pem(&pem)?;
     require(
-        context.certificate.public_key()?.public_eq(&key),
+        key.matches(&context.certificate)?,
         ERROR_INVALID_DATA,
         "Invalid or mismatched PKCS#8 private-key object",
     )?;
