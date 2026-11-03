@@ -1,11 +1,11 @@
 #![allow(non_camel_case_types, non_snake_case, dead_code)]
 
-use libc::{c_char, c_int, c_void, wchar_t};
+use core::ffi::{c_char, c_int, c_void};
 
 pub type BYTE = u8;
 pub type DWORD = u32;
 pub type BOOL = i32;
-pub type WCHAR = wchar_t;
+pub type WCHAR = u16;
 pub type LPCSTR = *const c_char;
 pub type LPCWSTR = *const WCHAR;
 pub type HCRYPTPROV_LEGACY = usize;
@@ -198,10 +198,16 @@ pub struct CERT_CHAIN_POLICY_STATUS {
 }
 
 pub type PFN_CERT_ENUM_SYSTEM_STORE = Option<
-    unsafe fn(*const c_void, DWORD, *mut CERT_SYSTEM_STORE_INFO, *mut c_void, *mut c_void) -> BOOL,
+    unsafe extern "system" fn(
+        *const c_void,
+        DWORD,
+        *const CERT_SYSTEM_STORE_INFO,
+        *const c_void,
+        *mut c_void,
+    ) -> BOOL,
 >;
 pub type PFN_CERT_ENUM_SYSTEM_STORE_LOCATION =
-    Option<unsafe fn(LPCWSTR, DWORD, *mut c_void, *mut c_void) -> BOOL>;
+    Option<unsafe extern "system" fn(LPCWSTR, DWORD, *const c_void, *mut c_void) -> BOOL>;
 
 #[repr(C)]
 pub struct SYS_CERT_NATIVE_OPTIONS {
@@ -301,6 +307,7 @@ pub const ERROR_NOT_SUPPORTED: DWORD = 50;
 pub const ERROR_INVALID_PARAMETER: DWORD = 87;
 pub const ERROR_BUSY: DWORD = 170;
 pub const ERROR_MORE_DATA: DWORD = 234;
+pub const ERROR_CALL_NOT_IMPLEMENTED: DWORD = 120;
 pub const E_INVALIDARG: DWORD = 0x80070057;
 pub const CRYPT_E_NOT_FOUND: DWORD = 0x80092004;
 pub const CRYPT_E_EXISTS: DWORD = 0x80092005;
@@ -317,6 +324,7 @@ pub fn bool_value(value: bool) -> BOOL {
     if value { TRUE } else { FALSE }
 }
 
+#[cfg(target_os = "linux")]
 pub fn dword(value: usize) -> Result<DWORD, crate::error::ApiError> {
     value.try_into().map_err(|_| {
         crate::error::ApiError::new(ERROR_INVALID_DATA, "Value exceeds DWORD capacity")

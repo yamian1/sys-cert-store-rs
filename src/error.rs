@@ -1,4 +1,5 @@
 use crate::api_types::*;
+use core::ffi::c_char;
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,6 +19,7 @@ impl ApiError {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl From<openssl::error::ErrorStack> for ApiError {
     fn from(value: openssl::error::ErrorStack) -> Self {
         Self::new(ERROR_INVALID_DATA, value.to_string())
@@ -35,6 +37,7 @@ impl From<std::io::Error> for ApiError {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl From<rusqlite::Error> for ApiError {
     fn from(value: rusqlite::Error) -> Self {
         use rusqlite::ErrorCode;
@@ -69,7 +72,7 @@ pub fn set_error(code: DWORD, message: &str) {
     LAST_MESSAGE.with(|slot| *slot.borrow_mut() = CString::new(safe).unwrap());
 }
 
-pub fn message_ptr() -> *const libc::c_char {
+pub fn message_ptr() -> *const c_char {
     LAST_MESSAGE.with(|slot| slot.borrow().as_ptr())
 }
 

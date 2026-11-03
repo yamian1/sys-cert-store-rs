@@ -1,6 +1,5 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
-use libc::wchar_t;
 use openssl::asn1::{Asn1Integer, Asn1Time};
 use openssl::bn::BigNum;
 use openssl::ec::{EcGroup, EcKey};
@@ -52,12 +51,8 @@ fn cstring(path: impl AsRef<Path>) -> CString {
     CString::new(path.as_ref().as_os_str().as_encoded_bytes()).unwrap()
 }
 
-fn wide(value: &str) -> Vec<wchar_t> {
-    value
-        .chars()
-        .map(|value| value as wchar_t)
-        .chain([0])
-        .collect()
+fn wide(value: &str) -> Vec<WCHAR> {
+    value.encode_utf16().chain([0]).collect()
 }
 
 fn key() -> PKey<Private> {

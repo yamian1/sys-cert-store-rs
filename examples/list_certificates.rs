@@ -16,10 +16,7 @@ fn last_error_message() -> String {
 }
 
 fn main() {
-    let mut name = "ROOT"
-        .chars()
-        .map(|character| character as WCHAR)
-        .collect::<Vec<_>>();
+    let mut name = "ROOT".encode_utf16().collect::<Vec<WCHAR>>();
     name.push(0);
 
     let store = CertOpenSystemStoreW(0, name.as_ptr());

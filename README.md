@@ -1,7 +1,13 @@
 # sys-cert-store-rs
 
-`sys-cert-store-rs` is a Rust library and command-line tool for managing
-certificate stores on Linux through a Win32-shaped API.
+`sys-cert-store-rs` is a multi-platform Rust library that exposes a
+Win32-shaped certificate-store API.
+
+- On Windows, standard CryptoAPI calls pass directly through to the operating
+  system.
+- On Linux, the crate provides persistent certificate stores, native trust
+  integration, PFX and PKCS#7 handling, chain operations, and PQC support.
+- The `certutil` command-line tool is currently available on Linux.
 
 It provides:
 
@@ -13,10 +19,10 @@ It provides:
 - PKCS#12/PFX import and export, including private keys and certificate chains
 - Offline certificate-chain construction and base-policy validation
 - PEM, DER, and base64 conversion
-- Native Linux trust-store integration
+- Native trust-store integration on Linux
 - ML-DSA and composite ML-DSA certificate support
 - .NET CRL-cache preloading
-- A `certutil`-style Linux command-line interface
+- A `certutil`-style command-line interface on Linux
 
 The supported public surfaces are the Rust crate and the `certutil`
 executable. The crate is an `rlib`; it does not expose a C ABI or install C/C++
@@ -43,7 +49,7 @@ use sys_cert_store::{
 };
 
 fn main() {
-    let mut store_name: Vec<WCHAR> = "ROOT".chars().map(|ch| ch as WCHAR).collect();
+    let mut store_name: Vec<WCHAR> = "ROOT".encode_utf16().collect();
     store_name.push(0);
 
     let store = CertOpenSystemStoreW(0, store_name.as_ptr());
@@ -71,7 +77,7 @@ Run the complete example with:
 cargo run --example list_certificates
 ```
 
-The crate exposes operations for:
+The crate exposes standard CryptoAPI operations for:
 
 - Opening memory, system, and PKCS#7 stores
 - Creating, duplicating, enumerating, finding, and freeing certificate contexts
@@ -79,16 +85,20 @@ The crate exposes operations for:
 - Importing and exporting PFX data
 - Saving stores as PKCS#7
 - Building and validating certificate chains
-- Updating native trust anchors
-- Locating persisted certificate files
-- Populating the .NET CRL cache
+- Updating native trust anchors on Linux
+- Locating persisted certificate files on Linux
+- Populating the .NET CRL cache on Linux
 
 The API is intentionally low level and uses handles, pointers, explicit
 lifetimes, two-call output-buffer patterns, and `GetLastError`-style error
-reporting. Call `SysCertGetLastErrorMessage` for the diagnostic message
-associated with the current thread's last error.
+reporting.
 
-## Use `certutil`
+On Windows, the standard `Cert*`, `Crypt*`, and PFX calls preserve native
+CryptoAPI behavior, handles, and last-error values. The Linux-specific
+`SysCert*` extensions return `ERROR_CALL_NOT_IMPLEMENTED` on Windows.
+`SysCertGetLastErrorMessage` is one of those Linux-specific extensions.
+
+## Use `certutil` on Linux
 
 Build and run the CLI:
 
@@ -131,7 +141,7 @@ and the explicit `--allow-native-write` option.
 Run `certutil --help` for certificate selectors, output formats, relocated
 store directories, and all supported options.
 
-## Store behavior
+## Linux store behavior
 
 `MY`, `CA`, and custom stores use persistent metadata and object storage.
 `ROOT` integrates with the native Linux trust configuration. User and machine
@@ -146,7 +156,7 @@ The chain APIs currently build complete, unambiguous offline chains from the
 available stores. Network retrieval and unsupported CryptoAPI chain options
 return an explicit error rather than silently changing behavior.
 
-## Post-quantum certificates
+## Post-quantum certificates on Linux
 
 The canonical CMake build includes the pinned cryptographic stack required for:
 
@@ -164,7 +174,7 @@ PKCS#7 handling, and PKCS#12 handling use Rust implementations.
 
 ## Build and test
 
-For regular Rust development:
+For regular Rust development on either platform:
 
 ```sh
 cargo build
@@ -172,7 +182,10 @@ cargo test --all-targets
 cargo clippy --all-targets -- -D warnings
 ```
 
-Direct Cargo builds use the system OpenSSL and are suitable for store and
+Windows builds use the operating system's CryptoAPI and do not build the Linux
+OpenSSL, SQLite, SCOSSL, or SymCrypt dependency stack.
+
+Direct Linux Cargo builds use the system OpenSSL and are suitable for store and
 classical-certificate development. They do not guarantee ML-DSA support.
 
 For a release build with the pinned PQC-capable crypto stack:
@@ -208,16 +221,16 @@ partial failures instead of silently producing an incomplete cache.
 ## Appendix A: cryptographic dependency architecture
 
 ```text
-Rust application                    certutil
-       |                               |
-       +---------------+---------------+
-                       |
-                       v
-              sys-cert-store crate
-                       |
-          +------------+-----------------------------+
-          |                                          |
-          v                                          v
+Rust application
+       |
+       v
+sys-cert-store crate
+       |
+       +-- Windows --> native Win32 CryptoAPI
+       |
+       +-- Linux ------------------------+-----------------------------+
+                                        |                             |
+                                        v                             v
  Rust-native classical path                   PQC signature path
           |                                          |
           +-- X.509 parsing                          +-- openssl crate
