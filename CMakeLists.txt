@@ -3,7 +3,6 @@ project(sys-cert-store VERSION 0.1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CTest)
-find_package(SQLite3 3.31 REQUIRED)
 find_package(Threads REQUIRED)
 
 option(SYS_CERT_STORE_SANITIZERS "Enable address and undefined behavior sanitizers" OFF)
@@ -36,77 +35,23 @@ set(SCS_CARGO_ENV
 
 add_custom_target(sys-cert-store-rust ALL
     COMMAND ${CMAKE_COMMAND} -E env ${SCS_CARGO_ENV}
-        ${CARGO_EXECUTABLE} build ${RUST_PROFILE_FLAG}
+        ${CARGO_EXECUTABLE} build ${RUST_PROFILE_FLAG} --all-targets
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     VERBATIM)
 add_dependencies(sys-cert-store-rust scs-crypto)
-
-add_library(sys-cert-store SHARED IMPORTED GLOBAL)
-add_dependencies(sys-cert-store sys-cert-store-rust)
-set_target_properties(sys-cert-store PROPERTIES
-    IMPORTED_LOCATION "${CARGO_TARGET_DIR}/${RUST_PROFILE}/libsys_cert_store.so"
-    INTERFACE_INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/include")
-add_library(sys-cert-store::sys-cert-store ALIAS sys-cert-store)
-
-add_executable(list-certificates examples/list-certificates.cpp)
-target_link_libraries(list-certificates PRIVATE sys-cert-store)
-set_target_properties(list-certificates PROPERTIES BUILD_RPATH "${CARGO_TARGET_DIR}/${RUST_PROFILE}")
-
-add_executable(certutil IMPORTED GLOBAL)
-add_dependencies(certutil sys-cert-store-rust)
-set_target_properties(certutil PROPERTIES
-    IMPORTED_LOCATION "${CARGO_TARGET_DIR}/${RUST_PROFILE}/certutil")
 
 if(BUILD_TESTING)
     add_test(NAME rust-tests COMMAND ${CMAKE_COMMAND} -E env ${SCS_CARGO_ENV}
         ${CARGO_EXECUTABLE} test ${RUST_PROFILE_FLAG})
     set_tests_properties(rust-tests PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
-    add_executable(compat-store-tests tests/compat-store-tests.cpp)
-    target_compile_features(compat-store-tests PRIVATE cxx_std_20)
-    target_include_directories(compat-store-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(compat-store-tests PRIVATE
-        sys-cert-store scs-crypto SQLite::SQLite3 Threads::Threads)
-    target_link_options(compat-store-tests PRIVATE "LINKER:--exclude-libs,ALL")
-    set_target_properties(compat-store-tests PROPERTIES
-        BUILD_RPATH "${CARGO_TARGET_DIR}/${RUST_PROFILE}")
-
-    add_test(NAME compatibility-tests COMMAND compat-store-tests)
-    add_test(NAME certutil-tests COMMAND compat-store-tests
-        --certutil "${CARGO_TARGET_DIR}/${RUST_PROFILE}/certutil")
-    add_test(NAME pqc-tests COMMAND compat-store-tests --pqc)
-    foreach(algorithm ML-DSA-44 ML-DSA-65 ML-DSA-87
-            MLDSA44-ECDSA-P256-SHA256 MLDSA65-ECDSA-P256-SHA512
-            MLDSA65-ECDSA-P384-SHA512 MLDSA87-ECDSA-P384-SHA512)
-        add_test(NAME certutil-${algorithm} COMMAND compat-store-tests
-            --certutil "${CARGO_TARGET_DIR}/${RUST_PROFILE}/certutil" ${algorithm})
-    endforeach()
-
     find_program(SCS_READELF NAMES readelf llvm-readelf REQUIRED)
     add_test(NAME static-crypto-linkage COMMAND ${CMAKE_COMMAND}
-        "-DREADELF=${SCS_READELF}" "-DLIBRARY=$<TARGET_FILE:sys-cert-store>"
+        "-DREADELF=${SCS_READELF}"
         "-DTOOL=${CARGO_TARGET_DIR}/${RUST_PROFILE}/certutil"
-        "-DTESTS=$<TARGET_FILE:compat-store-tests>"
+        "-DEXAMPLE=${CARGO_TARGET_DIR}/${RUST_PROFILE}/examples/list_certificates"
         -P "${PROJECT_SOURCE_DIR}/cmake/check-static-crypto.cmake")
 endif()
 
-install(FILES "${CARGO_TARGET_DIR}/${RUST_PROFILE}/libsys_cert_store.so"
-    DESTINATION ${CMAKE_INSTALL_LIBDIR} RENAME libsys-cert-store.so)
 install(PROGRAMS "${CARGO_TARGET_DIR}/${RUST_PROFILE}/certutil"
     DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
-include(CMakePackageConfigHelpers)
-configure_package_config_file(cmake/sys-cert-store-config.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-config.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sys-cert-store)
-write_basic_package_version_file(
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-config-version.cmake
-    COMPATIBILITY SameMajorVersion)
-configure_file(cmake/sys-cert-store-targets.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-targets.cmake @ONLY)
-install(FILES
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-config.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-config-version.cmake
-    ${CMAKE_CURRENT_BINARY_DIR}/sys-cert-store-targets.cmake
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/sys-cert-store)

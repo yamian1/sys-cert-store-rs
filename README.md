@@ -1,16 +1,14 @@
 # sys-cert-store-rs
 
-A Rust implementation of the Linux `sys-cert-store` API. It preserves the
-existing project's C ABI, Win32-shaped certificate-store surface, persistent
-SQLite/object layout, system-store scoping, native trust integration, and
-`certutil` command-line behavior.
+A Rust library and command-line tool for Linux certificate stores that area manageable in a Win32-style API. The crate
+provides persistent stores (MY/CA/ROOT), user and machine scoping,
+native trust integration, PKCS#7 and PKCS#12 handling, post-quantum
+certificates, .NET CRL-cache preloading, and a `certutil`-style CLI.
 
-The public headers are source-compatible with the C++ implementation. CMake
-builds the Rust `cdylib` as `libsys_cert_store.so`, installs it as
-`libsys-cert-store.so`, and exposes the installed
-`sys-cert-store::sys-cert-store` target.
+The supported public surfaces are the Rust crate and the `certutil` executable.
 
-## Release and compatibility build
+
+## Release build
 
 ```sh
 git submodule update --init third_party/openssl third_party/scossl third_party/symcrypt
@@ -21,8 +19,8 @@ ctest --test-dir build --output-on-failure
 cmake --install build
 ```
 
-The CMake build is the canonical build. It uses the same pinned cryptographic
-stack as the C++ implementation:
+The CMake build is the canonical release build. It assembles the pinned
+cryptographic stack and then builds every Rust target:
 
 - OpenSSL 3.5.8, built statically
 - patched SymCrypt-OpenSSL/SCOSSL with its provider built into the binaries
@@ -53,15 +51,21 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+To run the certificate-listing example:
+
+```sh
+cargo run --example list_certificates
+```
+
 Direct Cargo builds use the system OpenSSL and are intended for fast
 development of non-PQC store behavior. They do not provide the pinned provider
 or guarantee ML-DSA support. SQLite remains statically bundled in both build
 paths.
 
-The implementation targets native Linux. The compatibility suite exercises the
-original C ABI behavior, `certutil`, pure and composite ML-DSA, and verifies
-that release binaries neither depend dynamically on crypto libraries nor
-export their symbols.
+The implementation targets native Linux. Rust tests exercise store behavior,
+`certutil`, pure and composite ML-DSA, and .NET CRL caching. The release checks
+also verify that shipped executables neither depend dynamically on crypto
+libraries nor export their symbols.
 
 `SysCertPopulateDotNetCrlCache` preloads the private CRL cache used by .NET on
 Linux. With a UTF-8 user name, it discovers HTTP CRL distribution points from
@@ -70,14 +74,13 @@ that user's `MY`, `CA`, and `ROOT` views and writes validated PEM CRLs below
 .NET; another user follows that account's home-directory record. The caller
 must be root or the selected user.
 
-Passing `nullptr` scans `/proc/*/maps` for processes that have loaded
+Passing a null user-name pointer scans `/proc/*/maps` for processes that have loaded
 `libcoreclr.so`, deduplicates their effective UIDs, discovers CDPs from the
 computer `MY`, `CA`, and `ROOT` stores, and populates each discovered account's
-cache. Restricted `/proc` visibility is reported as a failure rather than
-silently producing an incomplete result. Downloads use HTTP, require a matching
-issuer and valid CRL signature, reject future/expired CRLs, and reproduce .NET's
+cache. Restricted `/proc` visibility is reported rather than silently producing
+an incomplete result. Downloads use HTTP, require a matching issuer and valid
+CRL signature, reject future or expired CRLs, and reproduce .NET's
 `<issuer-hash>.<URL-hash>.crl` name. Cache directories are `0700`, files are
 `0600`, writes are atomic, and root assigns ownership to the target account.
-Processing is best effort: successful independent entries remain cached, but
-the function returns `FALSE` and reports an aggregate diagnostic if any
-discovered operation fails.
+Processing is best effort: successful independent entries remain cached while
+failures are aggregated into the library's error state.

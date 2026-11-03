@@ -1,6 +1,6 @@
+use crate::api_types::*;
 use crate::cert::{Certificate, Context, Properties};
 use crate::error::{ApiError, require};
-use crate::ffi::*;
 use crate::key::PrivateKey;
 use crate::native::{NativeLayout, native_layout, read_native};
 use parking_lot::Mutex;

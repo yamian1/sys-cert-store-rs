@@ -1,7 +1,7 @@
+use crate::api_types::{ERROR_INVALID_DATA, ERROR_NOT_SUPPORTED};
 use crate::cert::Certificate;
 use crate::crypto::{is_pqc_oid, pqc_private_key_matches, validate_pqc_private_key};
 use crate::error::ApiError;
-use crate::ffi::{ERROR_INVALID_DATA, ERROR_NOT_SUPPORTED};
 use base64ct::{Base64, Encoding};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use pkcs8::PrivateKeyInfo;

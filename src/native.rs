@@ -1,6 +1,6 @@
+use crate::api_types::*;
 use crate::cert::Certificate;
 use crate::error::{ApiError, require};
-use crate::ffi::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;

@@ -1,6 +1,6 @@
+use crate::api_types::*;
 use crate::cert::Certificate;
 use crate::error::{ApiError, require};
-use crate::ffi::*;
 use crate::native::{native_layout, read_native};
 use crate::store::{SystemPaths, store_name, user_data_directory};
 use openssl::asn1::Asn1Time;

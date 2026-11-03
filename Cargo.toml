@@ -3,12 +3,12 @@ name = "sys-cert-store"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Rust implementation of the sys-cert-store Linux certificate store API"
+description = "Linux certificate-store library and certutil command-line tool"
 build = "build.rs"
 
 [lib]
 name = "sys_cert_store"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "certutil"

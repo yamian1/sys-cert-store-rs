@@ -1,7 +1,7 @@
-use crate::error::ApiError;
 #[cfg(scs_bundled_crypto)]
-use crate::ffi::ERROR_GEN_FAILURE;
-use crate::ffi::ERROR_INVALID_DATA;
+use crate::api_types::ERROR_GEN_FAILURE;
+use crate::api_types::ERROR_INVALID_DATA;
+use crate::error::ApiError;
 use openssl::pkey::PKey;
 use openssl::x509::X509;
 

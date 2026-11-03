@@ -1,4 +1,4 @@
-use crate::ffi::*;
+use crate::api_types::*;
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};

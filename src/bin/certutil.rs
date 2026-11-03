@@ -19,8 +19,8 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use sys_cert_store::api_types::*;
 use sys_cert_store::cert::Certificate as NativeCertificate;
-use sys_cert_store::ffi::*;
 use sys_cert_store::key::PrivateKey;
 use sys_cert_store::*;
 use zeroize::Zeroize;
@@ -767,7 +767,7 @@ fn chain(
     Ok(result)
 }
 
-unsafe extern "C" fn print_store(
+unsafe fn print_store(
     name: *const std::ffi::c_void,
     _: DWORD,
     _: *mut CERT_SYSTEM_STORE_INFO,

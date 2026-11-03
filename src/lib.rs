@@ -1,17 +1,17 @@
-#![allow(clippy::not_unsafe_ptr_arg_deref)]
+#![allow(clippy::not_unsafe_ptr_arg_deref, non_snake_case)]
 
+pub mod api_types;
 pub mod cert;
 mod crl_cache;
 mod crypto;
 mod error;
-pub mod ffi;
 pub mod key;
 mod native;
 mod store;
 
+use crate::api_types::*;
 use crate::cert::{Context, supported_property};
 use crate::error::{ApiError, boundary, last_error, message_ptr, require, set_error};
-use crate::ffi::*;
 use crate::key::PrivateKey;
 use crate::native::{native_layout, remove_trusted_certificate, update_anchor};
 use crate::store::*;
@@ -828,25 +828,19 @@ fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), Ap
     Ok(())
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn GetLastError() -> DWORD {
+pub fn GetLastError() -> DWORD {
     last_error()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SetLastError(error: DWORD) {
+pub fn SetLastError(error: DWORD) {
     set_error(error, "");
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertGetLastErrorMessage() -> *const c_char {
+pub fn SysCertGetLastErrorMessage() -> *const c_char {
     message_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertConfigureSystemStores(
-    configuration: *const SYS_CERT_STORE_CONFIGURATION,
-) -> BOOL {
+pub fn SysCertConfigureSystemStores(configuration: *const SYS_CERT_STORE_CONFIGURATION) -> BOOL {
     boundary(FALSE, || {
         let mut state = STATE.lock();
         require(
@@ -896,8 +890,7 @@ pub extern "C" fn SysCertConfigureSystemStores(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertGetCertificateStoreLocation(
+pub fn SysCertGetCertificateStoreLocation(
     certificate: *const CERT_CONTEXT,
     location: *mut DWORD,
 ) -> BOOL {
@@ -928,8 +921,7 @@ pub extern "C" fn SysCertGetCertificateStoreLocation(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertOpenStore(
+pub fn CertOpenStore(
     provider: LPCSTR,
     encoding: DWORD,
     legacy: HCRYPTPROV_LEGACY,
@@ -941,8 +933,7 @@ pub extern "C" fn CertOpenStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertOpenSystemStoreW(legacy: HCRYPTPROV_LEGACY, name: LPCWSTR) -> HCERTSTORE {
+pub fn CertOpenSystemStoreW(legacy: HCRYPTPROV_LEGACY, name: LPCWSTR) -> HCERTSTORE {
     boundary(ptr::null_mut(), || unsafe {
         open_store_api(
             PROVIDER_SYSTEM_W as LPCSTR,
@@ -954,8 +945,7 @@ pub extern "C" fn CertOpenSystemStoreW(legacy: HCRYPTPROV_LEGACY, name: LPCWSTR)
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertOpenSystemStoreA(legacy: HCRYPTPROV_LEGACY, name: LPCSTR) -> HCERTSTORE {
+pub fn CertOpenSystemStoreA(legacy: HCRYPTPROV_LEGACY, name: LPCSTR) -> HCERTSTORE {
     boundary(ptr::null_mut(), || unsafe {
         open_store_api(
             PROVIDER_SYSTEM_A as LPCSTR,
@@ -967,16 +957,14 @@ pub extern "C" fn CertOpenSystemStoreA(legacy: HCRYPTPROV_LEGACY, name: LPCSTR) 
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertDuplicateStore(handle: HCERTSTORE) -> HCERTSTORE {
+pub fn CertDuplicateStore(handle: HCERTSTORE) -> HCERTSTORE {
     boundary(ptr::null_mut(), || {
         STATE.lock().store_mut(handle)?.references += 1;
         Ok(handle)
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertCloseStore(handle: HCERTSTORE, flags: DWORD) -> BOOL {
+pub fn CertCloseStore(handle: HCERTSTORE, flags: DWORD) -> BOOL {
     boundary(FALSE, || {
         require(
             flags & !CERT_CLOSE_STORE_CHECK_FLAG == 0,
@@ -1008,8 +996,7 @@ pub extern "C" fn CertCloseStore(handle: HCERTSTORE, flags: DWORD) -> BOOL {
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertCreateCertificateContext(
+pub fn CertCreateCertificateContext(
     encoding: DWORD,
     encoded: *const BYTE,
     size: DWORD,
@@ -1021,26 +1008,21 @@ pub extern "C" fn CertCreateCertificateContext(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertDuplicateCertificateContext(
-    context: *const CERT_CONTEXT,
-) -> *const CERT_CONTEXT {
+pub fn CertDuplicateCertificateContext(context: *const CERT_CONTEXT) -> *const CERT_CONTEXT {
     boundary(ptr::null(), || {
         STATE.lock().context_mut(context)?.references += 1;
         Ok(context)
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertFreeCertificateContext(context: *const CERT_CONTEXT) -> BOOL {
+pub fn CertFreeCertificateContext(context: *const CERT_CONTEXT) -> BOOL {
     boundary(FALSE, || {
         STATE.lock().release_context(context)?;
         Ok(TRUE)
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertEnumCertificatesInStore(
+pub fn CertEnumCertificatesInStore(
     handle: HCERTSTORE,
     previous: *const CERT_CONTEXT,
 ) -> *const CERT_CONTEXT {
@@ -1055,8 +1037,7 @@ pub extern "C" fn CertEnumCertificatesInStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertFindCertificateInStore(
+pub fn CertFindCertificateInStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     flags: DWORD,
@@ -1080,8 +1061,7 @@ pub extern "C" fn CertFindCertificateInStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertGetSubjectCertificateFromStore(
+pub fn CertGetSubjectCertificateFromStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     information: *mut CERT_INFO,
@@ -1096,8 +1076,7 @@ pub extern "C" fn CertGetSubjectCertificateFromStore(
     )
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertGetIssuerCertificateFromStore(
+pub fn CertGetIssuerCertificateFromStore(
     handle: HCERTSTORE,
     subject: *const CERT_CONTEXT,
     previous: *const CERT_CONTEXT,
@@ -1154,8 +1133,7 @@ pub extern "C" fn CertGetIssuerCertificateFromStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertAddCertificateContextToStore(
+pub fn CertAddCertificateContextToStore(
     handle: HCERTSTORE,
     context: *const CERT_CONTEXT,
     disposition: DWORD,
@@ -1175,8 +1153,7 @@ pub extern "C" fn CertAddCertificateContextToStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertAddEncodedCertificateToStore(
+pub fn CertAddEncodedCertificateToStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     encoded: *const BYTE,
@@ -1204,16 +1181,14 @@ pub extern "C" fn CertAddEncodedCertificateToStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertDeleteCertificateFromStore(context: *const CERT_CONTEXT) -> BOOL {
+pub fn CertDeleteCertificateFromStore(context: *const CERT_CONTEXT) -> BOOL {
     boundary(FALSE, || {
         delete_context(&mut STATE.lock(), context)?;
         Ok(TRUE)
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertGetCertificateContextProperty(
+pub fn CertGetCertificateContextProperty(
     context: *const CERT_CONTEXT,
     property: DWORD,
     data: *mut c_void,
@@ -1228,8 +1203,7 @@ pub extern "C" fn CertGetCertificateContextProperty(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertSetCertificateContextProperty(
+pub fn CertSetCertificateContextProperty(
     context: *const CERT_CONTEXT,
     property: DWORD,
     flags: DWORD,
@@ -1317,8 +1291,7 @@ pub extern "C" fn CertSetCertificateContextProperty(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertEnumCertificateContextProperties(
+pub fn CertEnumCertificateContextProperties(
     context: *const CERT_CONTEXT,
     previous: DWORD,
 ) -> DWORD {
@@ -1335,8 +1308,7 @@ pub extern "C" fn CertEnumCertificateContextProperties(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertGetStoreProperty(
+pub fn CertGetStoreProperty(
     handle: HCERTSTORE,
     property: DWORD,
     data: *mut c_void,
@@ -1367,8 +1339,7 @@ pub extern "C" fn CertGetStoreProperty(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertSetStoreProperty(
+pub fn CertSetStoreProperty(
     handle: HCERTSTORE,
     property: DWORD,
     flags: DWORD,
@@ -1409,8 +1380,7 @@ pub extern "C" fn CertSetStoreProperty(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertControlStore(
+pub fn CertControlStore(
     handle: HCERTSTORE,
     flags: DWORD,
     control: DWORD,
@@ -1488,8 +1458,7 @@ pub extern "C" fn CertControlStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertSaveStore(
+pub fn CertSaveStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     save_as: DWORD,
@@ -1564,8 +1533,7 @@ pub extern "C" fn CertSaveStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertUpdateTrustAnchor(
+pub fn SysCertUpdateTrustAnchor(
     certificate: *const CERT_CONTEXT,
     install: BOOL,
     options: *const SYS_CERT_NATIVE_OPTIONS,
@@ -1608,8 +1576,7 @@ pub extern "C" fn SysCertUpdateTrustAnchor(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertImportPfxToStore(
+pub fn SysCertImportPfxToStore(
     handle: HCERTSTORE,
     pfx: *const CRYPT_DATA_BLOB,
     password: LPCWSTR,
@@ -1635,8 +1602,7 @@ pub extern "C" fn SysCertImportPfxToStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn PFXImportCertStore(
+pub fn PFXImportCertStore(
     pfx: *mut CRYPT_DATA_BLOB,
     password: LPCWSTR,
     flags: DWORD,
@@ -1678,8 +1644,7 @@ pub extern "C" fn PFXImportCertStore(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertGetCertificateFilePath(
+pub fn SysCertGetCertificateFilePath(
     certificate: *const CERT_CONTEXT,
     private_key: BOOL,
     path: *mut c_char,
@@ -1724,8 +1689,7 @@ pub extern "C" fn SysCertGetCertificateFilePath(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn SysCertPopulateDotNetCrlCache(user_name: LPCSTR) -> BOOL {
+pub fn SysCertPopulateDotNetCrlCache(user_name: LPCSTR) -> BOOL {
     boundary(FALSE, || {
         let user_name = if user_name.is_null() {
             None
@@ -1738,8 +1702,7 @@ pub extern "C" fn SysCertPopulateDotNetCrlCache(user_name: LPCSTR) -> BOOL {
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertEnumSystemStoreLocation(
+pub fn CertEnumSystemStoreLocation(
     flags: DWORD,
     argument: *mut c_void,
     callback: PFN_CERT_ENUM_SYSTEM_STORE_LOCATION,
@@ -1803,8 +1766,7 @@ pub extern "C" fn CertEnumSystemStoreLocation(
     })
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn CertEnumSystemStore(
+pub fn CertEnumSystemStore(
     flags: DWORD,
     location_parameter: *mut c_void,
     argument: *mut c_void,

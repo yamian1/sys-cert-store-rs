@@ -96,16 +96,10 @@ pub struct CERT_SYSTEM_STORE_INFO {
 }
 
 pub type PFN_CERT_ENUM_SYSTEM_STORE = Option<
-    unsafe extern "C" fn(
-        *const c_void,
-        DWORD,
-        *mut CERT_SYSTEM_STORE_INFO,
-        *mut c_void,
-        *mut c_void,
-    ) -> BOOL,
+    unsafe fn(*const c_void, DWORD, *mut CERT_SYSTEM_STORE_INFO, *mut c_void, *mut c_void) -> BOOL,
 >;
 pub type PFN_CERT_ENUM_SYSTEM_STORE_LOCATION =
-    Option<unsafe extern "C" fn(LPCWSTR, DWORD, *mut c_void, *mut c_void) -> BOOL>;
+    Option<unsafe fn(LPCWSTR, DWORD, *mut c_void, *mut c_void) -> BOOL>;
 
 #[repr(C)]
 pub struct SYS_CERT_NATIVE_OPTIONS {

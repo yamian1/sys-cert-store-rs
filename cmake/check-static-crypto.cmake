@@ -1,4 +1,7 @@
-foreach(binary "${LIBRARY}" "${TOOL}" "${TESTS}")
+foreach(binary "${TOOL}" "${EXAMPLE}")
+    if(NOT binary)
+        continue()
+    endif()
     execute_process(COMMAND "${READELF}" -d "${binary}" RESULT_VARIABLE result OUTPUT_VARIABLE dynamic ERROR_VARIABLE error)
     if(NOT result EQUAL 0)
         message(FATAL_ERROR "Cannot inspect ${binary}: ${error}")

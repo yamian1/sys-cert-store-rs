@@ -1,6 +1,6 @@
+use crate::api_types::*;
 use crate::crypto::{is_pqc_oid, verify_pqc_certificate};
 use crate::error::{ApiError, require};
-use crate::ffi::*;
 use crate::key::PrivateKey;
 use base64ct::{Base64, Encoding};
 use md5::Md5;
