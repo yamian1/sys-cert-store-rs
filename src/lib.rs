@@ -1,6 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod cert;
+mod crl_cache;
 mod crypto;
 mod error;
 pub mod ffi;
@@ -1719,6 +1720,20 @@ pub extern "C" fn SysCertGetCertificateFilePath(
         let mut value = selected.to_string_lossy().as_bytes().to_vec();
         value.push(0);
         copy_out(&value, path.cast(), size)?;
+        Ok(TRUE)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn SysCertPopulateDotNetCrlCache(user_name: LPCSTR) -> BOOL {
+    boundary(FALSE, || {
+        let user_name = if user_name.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(user_name) })
+        };
+        let state = STATE.lock();
+        crl_cache::populate(user_name, &state.paths)?;
         Ok(TRUE)
     })
 }

@@ -62,3 +62,22 @@ The implementation targets native Linux. The compatibility suite exercises the
 original C ABI behavior, `certutil`, pure and composite ML-DSA, and verifies
 that release binaries neither depend dynamically on crypto libraries nor
 export their symbols.
+
+`SysCertPopulateDotNetCrlCache` preloads the private CRL cache used by .NET on
+Linux. With a UTF-8 user name, it discovers HTTP CRL distribution points from
+that user's `MY`, `CA`, and `ROOT` views and writes validated PEM CRLs below
+`.dotnet/corefx/cryptography/crls`. The current user follows `HOME`, matching
+.NET; another user follows that account's home-directory record. The caller
+must be root or the selected user.
+
+Passing `nullptr` scans `/proc/*/maps` for processes that have loaded
+`libcoreclr.so`, deduplicates their effective UIDs, discovers CDPs from the
+computer `MY`, `CA`, and `ROOT` stores, and populates each discovered account's
+cache. Restricted `/proc` visibility is reported as a failure rather than
+silently producing an incomplete result. Downloads use HTTP, require a matching
+issuer and valid CRL signature, reject future/expired CRLs, and reproduce .NET's
+`<issuer-hash>.<URL-hash>.crl` name. Cache directories are `0700`, files are
+`0600`, writes are atomic, and root assigns ownership to the target account.
+Processing is best effort: successful independent entries remain cached, but
+the function returns `FALSE` and reports an aggregate diagnostic if any
+discovered operation fails.

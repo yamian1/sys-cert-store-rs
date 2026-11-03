@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::sync::Arc;
 use x509_parser::extensions::ParsedExtension;
+use x509_parser::extensions::{DistributionPointName, GeneralName};
 use x509_parser::prelude::*;
 
 pub type Properties = BTreeMap<DWORD, Vec<u8>>;
@@ -142,6 +143,39 @@ impl Certificate {
             }
         }
         Ok(None)
+    }
+
+    pub fn crl_distribution_points(&self) -> Result<Vec<String>, ApiError> {
+        let mut result = Vec::new();
+        for extension in self.parsed()?.extensions() {
+            if extension.oid.to_id_string() != "2.5.29.31" {
+                continue;
+            }
+            let ParsedExtension::CRLDistributionPoints(points) = extension.parsed_extension()
+            else {
+                return Err(ApiError::new(
+                    ERROR_INVALID_DATA,
+                    "A certificate has an invalid CRL distribution-points extension",
+                ));
+            };
+            for point in &points.points {
+                let Some(DistributionPointName::FullName(names)) = &point.distribution_point else {
+                    continue;
+                };
+                for name in names {
+                    let GeneralName::URI(uri) = name else {
+                        continue;
+                    };
+                    if !uri.as_bytes().contains(&0)
+                        && uri.len() >= 7
+                        && uri[..7].eq_ignore_ascii_case("http://")
+                    {
+                        result.push((*uri).to_owned());
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     pub fn is_ca(&self) -> Result<bool, ApiError> {

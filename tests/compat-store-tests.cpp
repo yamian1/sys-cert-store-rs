@@ -11,16 +11,25 @@
 #include <sqlite3.h>
 #include <array>
 #include <atomic>
+#include <arpa/inet.h>
+#include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
 #include <grp.h>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <netinet/in.h>
+#include <pwd.h>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
@@ -66,6 +75,21 @@ struct PrivateUmask {
     mode_t previous = umask(0077);
     ~PrivateUmask() { umask(previous); }
 };
+struct EnvironmentVariable {
+    std::string name;
+    std::string previous;
+    bool existed;
+    EnvironmentVariable(const char* variable, const std::string& value) : name(variable) {
+        const char* current = std::getenv(variable);
+        existed = current != nullptr;
+        if (current) previous = current;
+        CHECK(setenv(variable, value.c_str(), 1) == 0);
+    }
+    ~EnvironmentVariable() {
+        if (existed) setenv(name.c_str(), previous.c_str(), 1);
+        else unsetenv(name.c_str());
+    }
+};
 
 void write_file(const std::filesystem::path& path, const std::string& data) {
     std::filesystem::create_directories(path.parent_path());
@@ -98,7 +122,7 @@ Key signing_key(const char* algorithm) {
 }
 X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool ca,
     X509* issuer = nullptr, EVP_PKEY* issuer_key = nullptr, long not_before = -60,
-    const EVP_MD* digest = EVP_sha256()) {
+    const EVP_MD* digest = EVP_sha256(), const char* crl_url = nullptr) {
     X509Handle result(X509_new(), X509_free);
     CHECK(result);
     CHECK(X509_set_version(result.get(), 2) == 1);
@@ -116,6 +140,13 @@ X509Handle make_x509(EVP_PKEY* subject_key, long serial, const char* name, bool 
         X509V3_EXT_conf_nid(nullptr, &context, NID_basic_constraints, ca ? "critical,CA:TRUE" : "critical,CA:FALSE"),
         X509_EXTENSION_free);
     CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
+    if (crl_url) {
+        std::string value = "URI:";
+        value += crl_url;
+        extension.reset(X509V3_EXT_conf_nid(nullptr, &context,
+            NID_crl_distribution_points, value.c_str()));
+        CHECK(extension && X509_add_ext(result.get(), extension.get(), -1) == 1);
+    }
     CHECK(X509_sign(result.get(), issuer_key ? issuer_key : subject_key, digest) > 0);
     return result;
 }
@@ -146,6 +177,92 @@ std::string pem(X509* certificate) {
     auto size = BIO_get_mem_data(buffer.get(), &pointer);
     return std::string(pointer, static_cast<std::size_t>(size));
 }
+std::vector<BYTE> crl_der(X509_CRL* crl) {
+    int size = i2d_X509_CRL(crl, nullptr);
+    CHECK(size > 0);
+    std::vector<BYTE> result(static_cast<std::size_t>(size));
+    auto* cursor = result.data();
+    CHECK(i2d_X509_CRL(crl, &cursor) == size);
+    return result;
+}
+std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> make_crl(
+    X509* issuer, EVP_PKEY* issuer_key) {
+    std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> result(X509_CRL_new(), X509_CRL_free);
+    CHECK(result && X509_CRL_set_version(result.get(), 1) == 1);
+    CHECK(X509_CRL_set_issuer_name(result.get(), X509_get_subject_name(issuer)) == 1);
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> last(
+        ASN1_TIME_adj(nullptr, std::time(nullptr), 0, -60), ASN1_TIME_free);
+    std::unique_ptr<ASN1_TIME, decltype(&ASN1_TIME_free)> next(
+        ASN1_TIME_adj(nullptr, std::time(nullptr), 1, 0), ASN1_TIME_free);
+    CHECK(last && next);
+    CHECK(X509_CRL_set1_lastUpdate(result.get(), last.get()) == 1);
+    CHECK(X509_CRL_set1_nextUpdate(result.get(), next.get()) == 1);
+    CHECK(X509_CRL_sign(result.get(), issuer_key, EVP_sha256()) > 0);
+    return result;
+}
+struct HttpServer {
+    int socket = -1;
+    pid_t child = -1;
+    unsigned short port = 0;
+    HttpServer() {
+        socket = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        CHECK(socket >= 0);
+        int reuse = 1;
+        CHECK(setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        CHECK(bind(socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+        socklen_t size = sizeof(address);
+        CHECK(getsockname(socket, reinterpret_cast<sockaddr*>(&address), &size) == 0);
+        port = ntohs(address.sin_port);
+        CHECK(listen(socket, 1) == 0);
+    }
+    void start(const std::vector<BYTE>& body) {
+        child = fork();
+        CHECK(child >= 0);
+        if (child == 0) {
+            alarm(15);
+            int client = accept4(socket, nullptr, nullptr, SOCK_CLOEXEC);
+            if (client < 0) _exit(1);
+            std::array<char, 4096> request{};
+            if (read(client, request.data(), request.size()) <= 0) _exit(2);
+            std::string header = "HTTP/1.0 200 OK\r\nContent-Type: application/pkix-crl\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n";
+            auto send_all = [&](const void* input, std::size_t length) {
+                auto* cursor = static_cast<const BYTE*>(input);
+                while (length) {
+                    auto written = send(client, cursor, length, MSG_NOSIGNAL);
+                    if (written <= 0) _exit(3);
+                    cursor += written;
+                    length -= static_cast<std::size_t>(written);
+                }
+            };
+            send_all(header.data(), header.size());
+            send_all(body.data(), body.size());
+            close(client);
+            close(socket);
+            _exit(0);
+        }
+        close(socket);
+        socket = -1;
+    }
+    void wait() {
+        if (child <= 0) return;
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        child = -1;
+    }
+    ~HttpServer() {
+        if (socket >= 0) close(socket);
+        if (child > 0) {
+            int status = 0;
+            kill(child, SIGKILL);
+            waitpid(child, &status, 0);
+        }
+    }
+};
 PCCERT_CONTEXT create(const Bytes& encoded) {
     return CertCreateCertificateContext(X509_ASN_ENCODING, encoded.data(), static_cast<DWORD>(encoded.size()));
 }
@@ -905,6 +1022,79 @@ void system_scope_tests() {
     CHECK(SysCertConfigureSystemStores(nullptr));
 }
 
+void dotnet_crl_cache_tests() {
+    TempDir temp;
+    auto issuer_key = key();
+    auto leaf_key = key();
+    auto issuer = make_x509(issuer_key.get(), 201, "CRL Cache Root", true);
+    HttpServer server;
+    auto url = "http://127.0.0.1:" + std::to_string(server.port) + "/issuer.crl";
+    auto leaf = make_x509(leaf_key.get(), 202, "CRL Cache Leaf", false,
+        issuer.get(), issuer_key.get(), -60, EVP_sha256(), url.c_str());
+    auto crl = make_crl(issuer.get(), issuer_key.get());
+    server.start(crl_der(crl.get()));
+
+    auto user_store = (temp.path / "user-store").string();
+    auto machine_store = (temp.path / "machine-store").string();
+    auto system = (temp.path / "system").string();
+    write_file(std::filesystem::path(system) / "etc/os-release", "ID=ubuntu\n");
+    write_file(std::filesystem::path(system) / "etc/ssl/certs/ca-certificates.crt",
+        pem(issuer.get()));
+    SYS_CERT_STORE_CONFIGURATION configuration{
+        sizeof(configuration), user_store.c_str(), machine_store.c_str(), system.c_str()};
+    CHECK(SysCertConfigureSystemStores(&configuration));
+    {
+        Store personal(scoped(L"MY", CERT_SYSTEM_STORE_CURRENT_USER));
+        Certificate context(create(der(leaf.get())));
+        Certificate added(add(personal.value, context.value));
+    }
+
+    auto home = temp.path / "home";
+    std::filesystem::create_directory(home);
+    EnvironmentVariable home_variable("HOME", home.string());
+    EnvironmentVariable no_proxy("no_proxy", "127.0.0.1,localhost");
+    EnvironmentVariable no_proxy_upper("NO_PROXY", "127.0.0.1,localhost");
+    auto* account = getpwuid(geteuid());
+    CHECK(account && account->pw_name);
+    CHECK(SysCertPopulateDotNetCrlCache(account->pw_name));
+    server.wait();
+
+    std::vector<unsigned char> utf16;
+    for (auto byte : url) {
+        utf16.push_back(static_cast<unsigned char>(byte));
+        utf16.push_back(0);
+    }
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned digest_size = 0;
+    CHECK(EVP_Digest(utf16.data(), utf16.size(), digest.data(), &digest_size,
+        EVP_sha256(), nullptr) == 1 && digest_size >= 4);
+    std::uint32_t url_hash = static_cast<std::uint32_t>(digest[0]) |
+        (static_cast<std::uint32_t>(digest[1]) << 8) |
+        (static_cast<std::uint32_t>(digest[2]) << 16) |
+        (static_cast<std::uint32_t>(digest[3]) << 24);
+    std::ostringstream filename;
+    filename << std::hex << std::setfill('0') << std::nouppercase
+        << std::setw(8) << (X509_issuer_name_hash(leaf.get()) & 0xffffffffUL)
+        << '.' << std::setw(8) << url_hash << ".crl";
+    auto directory = home / ".dotnet/corefx/cryptography/crls";
+    auto cache_file = directory / filename.str();
+    CHECK(std::filesystem::is_regular_file(cache_file));
+    struct stat status{};
+    CHECK(stat(directory.c_str(), &status) == 0 && (status.st_mode & 0777) == 0700);
+    CHECK(stat(cache_file.c_str(), &status) == 0 && (status.st_mode & 0777) == 0600);
+    auto close_file = [](FILE* file) { std::fclose(file); };
+    std::unique_ptr<FILE, decltype(close_file)> input(std::fopen(cache_file.c_str(), "rb"), close_file);
+    CHECK(input);
+    std::unique_ptr<X509_CRL, decltype(&X509_CRL_free)> cached(
+        PEM_read_X509_CRL(input.get(), nullptr, nullptr, nullptr), X509_CRL_free);
+    CHECK(cached && X509_CRL_cmp(cached.get(), crl.get()) == 0);
+    CHECK(SysCertConfigureSystemStores(nullptr));
+
+    const char invalid_name[] = {static_cast<char>(0xff), '\0'};
+    CHECK(!SysCertPopulateDotNetCrlCache(invalid_name));
+    CHECK(GetLastError() == E_INVALIDARG);
+}
+
 void certutil_tests(const char* executable, const char* algorithm = nullptr) {
     TempDir temp;
     auto user = (temp.path / "user").string();
@@ -1271,6 +1461,7 @@ int main(int argc, char** argv) {
         error_tests();
         thread_tests();
         system_scope_tests();
+        dotnet_crl_cache_tests();
         std::cout << "All certificate-store tests passed\n";
         return 0;
     } catch (const std::exception& error) {
