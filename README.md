@@ -1,9 +1,10 @@
 # sys-cert-store-rs
 
-A Rust library and command-line tool for Linux certificate stores that area manageable in a Win32-style API. The crate
-provides persistent stores (MY/CA/ROOT), user and machine scoping,
-native trust integration, PKCS#7 and PKCS#12 handling, post-quantum
-certificates, .NET CRL-cache preloading, and a `certutil`-style CLI.
+A Rust library and command-line tool for Linux certificate stores managed
+through a Win32-shaped Rust API. The crate provides persistent stores
+(MY/CA/ROOT), user and machine scoping, native trust integration, PKCS#7 and
+PKCS#12 handling, post-quantum certificates, .NET CRL-cache preloading, and a
+`certutil`-style CLI.
 
 The supported public surfaces are the Rust crate and the `certutil` executable.
 
