@@ -10,6 +10,7 @@ pub type LPCSTR = *const c_char;
 pub type LPCWSTR = *const WCHAR;
 pub type HCRYPTPROV_LEGACY = usize;
 pub type HCERTSTORE = *mut c_void;
+pub type HCERTCHAINENGINE = *mut c_void;
 
 pub const TRUE: BOOL = 1;
 pub const FALSE: BOOL = 0;
@@ -95,6 +96,107 @@ pub struct CERT_SYSTEM_STORE_INFO {
     pub cbSize: DWORD,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GUID {
+    pub Data1: DWORD,
+    pub Data2: u16,
+    pub Data3: u16,
+    pub Data4: [BYTE; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_ENHKEY_USAGE {
+    pub cUsageIdentifier: DWORD,
+    pub rgpszUsageIdentifier: *mut *mut c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_USAGE_MATCH {
+    pub dwType: DWORD,
+    pub Usage: CERT_ENHKEY_USAGE,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_CHAIN_PARA {
+    pub cbSize: DWORD,
+    pub RequestedUsage: CERT_USAGE_MATCH,
+    pub RequestedIssuancePolicy: CERT_USAGE_MATCH,
+    pub dwUrlRetrievalTimeout: DWORD,
+    pub fCheckRevocationFreshnessTime: BOOL,
+    pub dwRevocationFreshnessTime: DWORD,
+    pub pftCacheResync: *mut FILETIME,
+    pub pStrongSignPara: *const c_void,
+    pub dwStrongSignFlags: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_TRUST_STATUS {
+    pub dwErrorStatus: DWORD,
+    pub dwInfoStatus: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_CHAIN_ELEMENT {
+    pub cbSize: DWORD,
+    pub pCertContext: *const CERT_CONTEXT,
+    pub TrustStatus: CERT_TRUST_STATUS,
+    pub pRevocationInfo: *mut c_void,
+    pub pIssuanceUsage: *mut CERT_ENHKEY_USAGE,
+    pub pApplicationUsage: *mut CERT_ENHKEY_USAGE,
+    pub pwszExtendedErrorInfo: LPCWSTR,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_SIMPLE_CHAIN {
+    pub cbSize: DWORD,
+    pub TrustStatus: CERT_TRUST_STATUS,
+    pub cElement: DWORD,
+    pub rgpElement: *mut *mut CERT_CHAIN_ELEMENT,
+    pub pTrustListInfo: *mut c_void,
+    pub fHasRevocationFreshnessTime: BOOL,
+    pub dwRevocationFreshnessTime: DWORD,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_CHAIN_CONTEXT {
+    pub cbSize: DWORD,
+    pub TrustStatus: CERT_TRUST_STATUS,
+    pub cChain: DWORD,
+    pub rgpChain: *mut *mut CERT_SIMPLE_CHAIN,
+    pub cLowerQualityChainContext: DWORD,
+    pub rgpLowerQualityChainContext: *mut *const CERT_CHAIN_CONTEXT,
+    pub fHasRevocationFreshnessTime: BOOL,
+    pub dwRevocationFreshnessTime: DWORD,
+    pub dwCreateFlags: DWORD,
+    pub ChainId: GUID,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_CHAIN_POLICY_PARA {
+    pub cbSize: DWORD,
+    pub dwFlags: DWORD,
+    pub pvExtraPolicyPara: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CERT_CHAIN_POLICY_STATUS {
+    pub cbSize: DWORD,
+    pub dwError: DWORD,
+    pub lChainIndex: i32,
+    pub lElementIndex: i32,
+    pub pvExtraPolicyStatus: *mut c_void,
+}
+
 pub type PFN_CERT_ENUM_SYSTEM_STORE = Option<
     unsafe fn(*const c_void, DWORD, *mut CERT_SYSTEM_STORE_INFO, *mut c_void, *mut c_void) -> BOOL,
 >;
@@ -169,10 +271,22 @@ pub const CERT_STORE_CTRL_RESYNC: DWORD = 1;
 pub const CERT_STORE_CTRL_COMMIT: DWORD = 3;
 pub const CERT_STORE_SAVE_AS_PKCS7: DWORD = 2;
 pub const CERT_STORE_SAVE_TO_MEMORY: DWORD = 2;
+pub const CERT_NAME_ISSUER_FLAG: DWORD = 1;
+pub const CERT_NAME_RDN_TYPE: DWORD = 2;
+pub const CERT_NAME_SIMPLE_DISPLAY_TYPE: DWORD = 4;
+pub const CERT_X500_NAME_STR: DWORD = 3;
+pub const CRYPT_STRING_BASE64HEADER: DWORD = 0;
+pub const CRYPT_STRING_BASE64: DWORD = 1;
+pub const CRYPT_STRING_BASE64_ANY: DWORD = 6;
+pub const CRYPT_STRING_ANY: DWORD = 7;
 pub const CRYPT_EXPORTABLE: DWORD = 1;
 pub const CRYPT_USER_KEYSET: DWORD = 0x1000;
 pub const CRYPT_MACHINE_KEYSET: DWORD = 0x20;
 pub const PKCS12_NO_PERSIST_KEY: DWORD = 0x8000;
+pub const REPORT_NO_PRIVATE_KEY: DWORD = 1;
+pub const REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY: DWORD = 2;
+pub const EXPORT_PRIVATE_KEYS: DWORD = 4;
+pub const CERT_CHAIN_POLICY_BASE: usize = 1;
 pub const SYS_CERT_TRUST_UPDATE_ALLOW: DWORD = 1;
 pub const SYS_CERT_STORE_NATIVE_WRITE_FLAG: DWORD = 0x10000000;
 
@@ -195,6 +309,7 @@ pub const CRYPT_E_NO_MATCH: DWORD = 0x80092009;
 pub const CRYPT_E_PENDING_CLOSE: DWORD = 0x8009200f;
 
 pub const PROVIDER_MEMORY: usize = 2;
+pub const PROVIDER_PKCS7: usize = 5;
 pub const PROVIDER_SYSTEM_A: usize = 9;
 pub const PROVIDER_SYSTEM_W: usize = 10;
 

@@ -1,18 +1,3 @@
-use base64ct::{Base64, Encoding};
-use cms::cert::CertificateChoices;
-use cms::content_info::ContentInfo;
-use cms::signed_data::SignedData;
-use der::{Decode, Encode};
-use openssl::nid::Nid;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::PKey;
-use openssl::stack::Stack;
-use openssl::x509::X509;
-use p12_keystore::{
-    Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKey as P12PrivateKey,
-    PrivateKeyChain,
-};
-use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
@@ -21,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use sys_cert_store::api_types::*;
 use sys_cert_store::cert::Certificate as NativeCertificate;
-use sys_cert_store::key::PrivateKey;
 use sys_cert_store::*;
 use zeroize::Zeroize;
 
@@ -307,6 +291,13 @@ impl Drop for CertificateContext {
     }
 }
 
+struct CertificateChain(*const CERT_CHAIN_CONTEXT);
+impl Drop for CertificateChain {
+    fn drop(&mut self) {
+        CertFreeCertificateChain(self.0);
+    }
+}
+
 struct Entry {
     context: CertificateContext,
     certificate: NativeCertificate,
@@ -380,7 +371,70 @@ fn hex_bytes(value: &[u8]) -> String {
     hex::encode(value)
 }
 
+fn certificate_name(context: *const CERT_CONTEXT, issuer: bool) -> Result<String, String> {
+    let flags = if issuer { CERT_NAME_ISSUER_FLAG } else { 0 };
+    let size = CertGetNameStringA(
+        context,
+        CERT_NAME_RDN_TYPE,
+        flags,
+        ptr::null(),
+        ptr::null_mut(),
+        0,
+    );
+    api(size != 0, (), "Size certificate name")?;
+    let mut output = vec![0i8; size as usize];
+    api(
+        CertGetNameStringA(
+            context,
+            CERT_NAME_RDN_TYPE,
+            flags,
+            ptr::null(),
+            output.as_mut_ptr(),
+            size,
+        ) != 0,
+        (),
+        "Format certificate name",
+    )?;
+    Ok(unsafe { CStr::from_ptr(output.as_ptr()) }
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn certificate_pem(certificate: &NativeCertificate) -> Result<Vec<u8>, String> {
+    let der = certificate.to_der();
+    let mut size = 0;
+    api(
+        CryptBinaryToStringA(
+            der.as_ptr(),
+            der.len() as DWORD,
+            CRYPT_STRING_BASE64HEADER,
+            ptr::null_mut(),
+            &mut size,
+        ) != FALSE,
+        (),
+        "Size certificate PEM",
+    )?;
+    let mut output = vec![0i8; size as usize];
+    api(
+        CryptBinaryToStringA(
+            der.as_ptr(),
+            der.len() as DWORD,
+            CRYPT_STRING_BASE64HEADER,
+            output.as_mut_ptr(),
+            &mut size,
+        ) != FALSE,
+        (),
+        "Encode certificate PEM",
+    )?;
+    Ok(output
+        .into_iter()
+        .take(size.saturating_sub(1) as usize)
+        .map(|value| value as u8)
+        .collect())
+}
+
 fn show(
+    context: *const CERT_CONTEXT,
     certificate: &NativeCertificate,
     index: usize,
     verbose: bool,
@@ -389,14 +443,14 @@ fn show(
     println!(
         "================ Certificate {index} ================\nSerial Number: {}\nIssuer: {}\n NotBefore: {}\n NotAfter: {}\nSubject: {}\nCert Hash(sha1): {}\nCert Hash(sha256): {}",
         certificate.serial_hex().map_err(|error| error.message)?,
-        certificate.issuer_text().map_err(|error| error.message)?,
+        certificate_name(context, true)?,
         certificate
             .not_before_text()
             .map_err(|error| error.message)?,
         certificate
             .not_after_text()
             .map_err(|error| error.message)?,
-        certificate.subject_text().map_err(|error| error.message)?,
+        certificate_name(context, false)?,
         hex_bytes(&certificate.sha1_fingerprint()),
         hex_bytes(&certificate.sha256_fingerprint()),
     );
@@ -415,7 +469,10 @@ fn show(
         println!();
     }
     if verbose {
-        print!("{}", String::from_utf8_lossy(&certificate.to_pem()));
+        print!(
+            "{}",
+            String::from_utf8_lossy(&certificate_pem(certificate)?)
+        );
     }
     Ok(())
 }
@@ -432,62 +489,70 @@ fn read_file(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 fn pkcs7_certificates(data: &[u8]) -> Result<Vec<NativeCertificate>, String> {
-    let content = ContentInfo::from_der(data).map_err(|_| "Invalid PKCS#7 container")?;
-    if content.content_type != const_oid::db::rfc5911::ID_SIGNED_DATA {
-        return Err("Only signed-data PKCS#7 certificate containers are supported".into());
+    let mut data = data.to_vec();
+    let blob = CRYPT_DATA_BLOB {
+        cbData: data.len() as DWORD,
+        pbData: data.as_mut_ptr(),
+    };
+    let store = Store(CertOpenStore(
+        PROVIDER_PKCS7 as LPCSTR,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        0,
+        CERT_STORE_READONLY_FLAG,
+        (&blob as *const CRYPT_DATA_BLOB).cast(),
+    ));
+    api(!store.0.is_null(), (), "Open PKCS#7 certificate store")?;
+    let mut result = Vec::new();
+    let mut cursor = ptr::null();
+    loop {
+        cursor = CertEnumCertificatesInStore(store.0, cursor);
+        if cursor.is_null() {
+            if GetLastError() == CRYPT_E_NOT_FOUND {
+                break;
+            }
+            return api(false, result, "Enumerate PKCS#7 certificates");
+        }
+        let public = unsafe { &*cursor };
+        let der = unsafe {
+            std::slice::from_raw_parts(public.pbCertEncoded, public.cbCertEncoded as usize)
+        };
+        result.push(NativeCertificate::from_der(der).map_err(|error| error.message)?);
     }
-    let signed = SignedData::from_der(
-        &content
-            .content
-            .to_der()
-            .map_err(|_| "Invalid PKCS#7 signed-data content")?,
-    )
-    .map_err(|_| "Invalid PKCS#7 signed-data content")?;
-    let values = signed
-        .certificates
-        .ok_or("PKCS#7 contains no certificates")?;
-    let certificates = values
-        .0
-        .iter()
-        .filter_map(|value| match value {
-            CertificateChoices::Certificate(certificate) => Some(
-                certificate
-                    .to_der()
-                    .map_err(|_| "Invalid certificate in PKCS#7 container".to_owned())
-                    .and_then(|der| {
-                        NativeCertificate::from_der(&der).map_err(|error| error.message)
-                    }),
-            ),
-            CertificateChoices::Other(_) => None,
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if certificates.is_empty() {
-        return Err("PKCS#7 contains no certificates".into());
-    }
+    Ok(result)
+}
 
-    let mut remaining = certificates
-        .into_iter()
-        .map(|certificate| {
-            let subject = certificate.subject_raw().map_err(|error| error.message)?;
-            let issuer = certificate.issuer_raw().map_err(|error| error.message)?;
-            Ok((certificate, subject, issuer))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut ordered = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        let next = remaining
-            .iter()
-            .enumerate()
-            .position(|(index, (_, _, issuer))| {
-                !remaining
-                    .iter()
-                    .enumerate()
-                    .any(|(other, (_, subject, _))| other != index && subject == issuer)
-            })
-            .unwrap_or(0);
-        ordered.push(remaining.remove(next).0);
-    }
-    Ok(ordered)
+fn decode_pem(block: &str) -> Result<Vec<u8>, String> {
+    let block = CString::new(block).map_err(|_| "PEM block contains NUL")?;
+    let mut size = 0;
+    api(
+        CryptStringToBinaryA(
+            block.as_ptr(),
+            0,
+            CRYPT_STRING_ANY,
+            ptr::null_mut(),
+            &mut size,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ) != FALSE,
+        (),
+        "Size decoded PEM",
+    )?;
+    let mut output = vec![0u8; size as usize];
+    api(
+        CryptStringToBinaryA(
+            block.as_ptr(),
+            0,
+            CRYPT_STRING_ANY,
+            output.as_mut_ptr(),
+            &mut size,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        ) != FALSE,
+        (),
+        "Decode PEM",
+    )?;
+    output.truncate(size as usize);
+    Ok(output)
 }
 
 fn certificates(data: &[u8]) -> Result<Vec<NativeCertificate>, String> {
@@ -506,15 +571,11 @@ fn certificates(data: &[u8]) -> Result<Vec<NativeCertificate>, String> {
             let end = remainder.find(end_marker).ok_or("Truncated PEM block")? + end_marker.len();
             let block = &remainder[..end];
             if pkcs7 {
-                let encoded = block
-                    .lines()
-                    .filter(|line| !line.starts_with("-----"))
-                    .collect::<String>();
-                let der = Base64::decode_vec(&encoded).map_err(|_| "Invalid PEM PKCS#7")?;
+                let der = decode_pem(block)?;
                 result.extend(pkcs7_certificates(&der)?);
             } else {
                 result.push(
-                    NativeCertificate::from_pem(block.as_bytes())
+                    NativeCertificate::from_der(&decode_pem(block)?)
                         .map_err(|_| "Invalid PEM certificate")?,
                 );
             }
@@ -588,13 +649,7 @@ fn matches(entry: &Entry, selector: &str) -> Result<bool, Usage> {
         return Ok(true);
     }
     Ok((kind.is_empty() || kind == "subject")
-        && lower(
-            &entry
-                .certificate
-                .subject_text()
-                .map_err(|error| Usage(error.message))?,
-        )
-        .contains(&lower(token)))
+        && lower(&certificate_name(entry.context.0, false).map_err(Usage)?).contains(&lower(token)))
 }
 
 fn write_file(path: &Path, data: &[u8], force: bool) -> Result<(), String> {
@@ -680,34 +735,6 @@ fn password(options: &Options, exporting: bool) -> Result<String, String> {
     Ok(value)
 }
 
-fn key_for(context: *const CERT_CONTEXT) -> Result<PrivateKey, String> {
-    let mut size = 0;
-    api(
-        SysCertGetCertificateFilePath(context, TRUE, ptr::null_mut(), &mut size) != FALSE,
-        (),
-        "Access certificate private key",
-    )?;
-    let mut path = vec![0i8; size as usize];
-    api(
-        SysCertGetCertificateFilePath(context, TRUE, path.as_mut_ptr(), &mut size) != FALSE,
-        (),
-        "Get private-key path",
-    )?;
-    let path = unsafe { CStr::from_ptr(path.as_ptr()) }.to_string_lossy();
-    let metadata =
-        fs::symlink_metadata(path.as_ref()).map_err(|_| "Cannot open private-key file")?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err("Unsafe private-key file ownership or permissions".into());
-    }
-    PrivateKey::from_pem(&fs::read(path.as_ref()).map_err(|error| error.to_string())?)
-        .map_err(|error| error.message)
-}
-
 fn self_signed(certificate: &NativeCertificate) -> bool {
     certificate.self_signed().unwrap_or(false)
 }
@@ -723,45 +750,111 @@ fn chain(
     if no_chain || self_signed(leaf) {
         return Ok(Vec::new());
     }
-    let mut candidates = Vec::new();
+    let candidates = Store(CertOpenStore(
+        PROVIDER_MEMORY as LPCSTR,
+        0,
+        0,
+        0,
+        ptr::null(),
+    ));
+    api(
+        !candidates.0.is_null(),
+        (),
+        "Create certificate-chain store",
+    )?;
+    for entry in source {
+        api(
+            CertAddCertificateContextToStore(
+                candidates.0,
+                entry.context.0,
+                CERT_STORE_ADD_ALWAYS,
+                ptr::null_mut(),
+            ) != FALSE,
+            (),
+            "Add certificate-chain candidate",
+        )?;
+    }
     for extra in ["CA", "ROOT"] {
         if name_value.eq_ignore_ascii_case(extra) {
             continue;
         }
-        candidates.extend(entries(&open_store(options, extra, false)?)?);
+        for entry in entries(&open_store(options, extra, false)?)? {
+            api(
+                CertAddCertificateContextToStore(
+                    candidates.0,
+                    entry.context.0,
+                    CERT_STORE_ADD_ALWAYS,
+                    ptr::null_mut(),
+                ) != FALSE,
+                (),
+                "Add system certificate-chain candidate",
+            )?;
+        }
     }
-    let mut seen = HashSet::from([hex_bytes(&leaf.sha256_fingerprint())]);
-    let mut current = leaf.clone();
+    let leaf_context = source
+        .iter()
+        .find(|entry| entry.certificate.sha256_fingerprint() == leaf.sha256_fingerprint())
+        .ok_or("Selected certificate context is unavailable")?;
+    let parameters = CERT_CHAIN_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as DWORD,
+        ..CERT_CHAIN_PARA::default()
+    };
+    let mut raw_chain = ptr::null();
+    api(
+        CertGetCertificateChain(
+            ptr::null_mut(),
+            leaf_context.context.0,
+            ptr::null(),
+            candidates.0,
+            &parameters,
+            0,
+            ptr::null_mut(),
+            &mut raw_chain,
+        ) != FALSE,
+        (),
+        "Build certificate chain",
+    )?;
+    let chain = CertificateChain(raw_chain);
+    let policy_parameters = CERT_CHAIN_POLICY_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as DWORD,
+        ..CERT_CHAIN_POLICY_PARA::default()
+    };
+    let mut policy_status = CERT_CHAIN_POLICY_STATUS {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as DWORD,
+        ..CERT_CHAIN_POLICY_STATUS::default()
+    };
+    api(
+        CertVerifyCertificateChainPolicy(
+            CERT_CHAIN_POLICY_BASE as LPCSTR,
+            chain.0,
+            &policy_parameters,
+            &mut policy_status,
+        ) != FALSE,
+        (),
+        "Verify certificate-chain policy",
+    )?;
+    if policy_status.dwError != ERROR_SUCCESS {
+        return Err(format!(
+            "Certificate-chain policy failed (0x{:x})",
+            policy_status.dwError
+        ));
+    }
+    let public = unsafe { &*chain.0 };
+    if public.cChain != 1 || public.rgpChain.is_null() {
+        return Err("Certificate-chain result is malformed".into());
+    }
+    let simple = unsafe { &**public.rgpChain };
     let mut result = Vec::new();
-    while !self_signed(&current) {
-        let mut issuers = BTreeMap::new();
-        for entry in source.iter().chain(candidates.iter()) {
-            if entry
-                .certificate
-                .subject_raw()
-                .map_err(|error| error.message)?
-                == current.issuer_raw().map_err(|error| error.message)?
-                && current
-                    .verify_with(&entry.certificate)
-                    .map_err(|error| error.message)?
-            {
-                issuers.insert(
-                    hex_bytes(&entry.certificate.sha256_fingerprint()),
-                    entry.certificate.clone(),
-                );
-            }
+    for index in 1..simple.cElement as usize {
+        let element = unsafe { &**simple.rgpElement.add(index) };
+        let context = unsafe { &*element.pCertContext };
+        let der = unsafe {
+            std::slice::from_raw_parts(context.pbCertEncoded, context.cbCertEncoded as usize)
+        };
+        let issuer = NativeCertificate::from_der(der).map_err(|error| error.message)?;
+        if no_root && index + 1 == simple.cElement as usize && self_signed(&issuer) {
+            continue;
         }
-        if issuers.len() != 1 {
-            return Err("Cannot build an unambiguous complete offline issuer chain; use NoChain for a leaf-only export".into());
-        }
-        let (hash, issuer) = issuers.pop_first().unwrap();
-        if !seen.insert(hash) {
-            return Err("Cycle in certificate issuer chain".into());
-        }
-        if no_root && self_signed(&issuer) {
-            break;
-        }
-        current = issuer.clone();
         result.push(issuer);
     }
     Ok(result)
@@ -806,7 +899,14 @@ fn execute(mut options: Options) -> Result<(), String> {
                 .iter()
                 .enumerate()
             {
-                show(certificate, index, options.verbose, None)?;
+                let der = certificate.to_der();
+                let context = CertificateContext(CertCreateCertificateContext(
+                    X509_ASN_ENCODING,
+                    der.as_ptr(),
+                    der.len() as DWORD,
+                ));
+                api(!context.0.is_null(), (), "Create certificate context")?;
+                show(context.0, certificate, index, options.verbose, None)?;
             }
         }
         "-addstore" => {
@@ -934,13 +1034,6 @@ fn execute(mut options: Options) -> Result<(), String> {
                 println!("Certificate deleted from {store_name}.");
             } else if exporting {
                 let entry = &contents[selected[0]];
-                let key = key_for(entry.context.0)?;
-                if !key
-                    .matches(&entry.certificate)
-                    .map_err(|error| error.message)?
-                {
-                    return Err("Private key does not match certificate".into());
-                }
                 let issuers = chain(
                     &options,
                     &store_name,
@@ -949,54 +1042,75 @@ fn execute(mut options: Options) -> Result<(), String> {
                     no_chain,
                     no_root,
                 )?;
+                let export_store = Store(CertOpenStore(
+                    PROVIDER_MEMORY as LPCSTR,
+                    0,
+                    0,
+                    0,
+                    ptr::null(),
+                ));
+                api(!export_store.0.is_null(), (), "Create PFX export store")?;
+                api(
+                    CertAddCertificateContextToStore(
+                        export_store.0,
+                        entry.context.0,
+                        CERT_STORE_ADD_ALWAYS,
+                        ptr::null_mut(),
+                    ) != FALSE,
+                    (),
+                    "Add PFX leaf certificate",
+                )?;
+                for issuer in &issuers {
+                    let der = issuer.to_der();
+                    let context = CertificateContext(CertCreateCertificateContext(
+                        X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as DWORD,
+                    ));
+                    api(!context.0.is_null(), (), "Create PFX issuer context")?;
+                    api(
+                        CertAddCertificateContextToStore(
+                            export_store.0,
+                            context.0,
+                            CERT_STORE_ADD_ALWAYS,
+                            ptr::null_mut(),
+                        ) != FALSE,
+                        (),
+                        "Add PFX issuer certificate",
+                    )?;
+                }
                 let mut secret = password(&options, true)?;
-                let encoded = if key.is_pqc() {
-                    let key = PKey::private_key_from_der(key.to_der())
-                        .map_err(|error| error.to_string())?;
-                    let certificate = X509::from_der(&entry.certificate.to_der())
-                        .map_err(|error| error.to_string())?;
-                    let mut stack = Stack::new().map_err(|error| error.to_string())?;
-                    for issuer in &issuers {
-                        stack
-                            .push(
-                                X509::from_der(&issuer.to_der())
-                                    .map_err(|error| error.to_string())?,
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
-                    let mut builder = Pkcs12::builder();
-                    builder
-                        .pkey(&key)
-                        .cert(&certificate)
-                        .ca(stack)
-                        .key_algorithm(Nid::AES_256_CBC)
-                        .cert_algorithm(Nid::AES_256_CBC);
-                    builder
-                        .build2(&secret)
-                        .and_then(|pfx| pfx.to_der())
-                        .map_err(|error| error.to_string())?
-                } else {
-                    let certificates = std::iter::once(&entry.certificate)
-                        .chain(issuers.iter())
-                        .map(|certificate| {
-                            P12Certificate::from_der(&certificate.to_der())
-                                .map_err(|error| error.to_string())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let private_key =
-                        P12PrivateKey::from_der(key.to_der()).map_err(|error| error.to_string())?;
-                    let chain = PrivateKeyChain::new(
-                        entry.certificate.sha1_fingerprint(),
-                        private_key,
-                        certificates,
-                    );
-                    let mut keystore = KeyStore::new();
-                    keystore.add_entry("sys-cert-store", KeyStoreEntry::PrivateKeyChain(chain));
-                    keystore
-                        .writer(&secret)
-                        .write()
-                        .map_err(|error| error.to_string())?
-                };
+                let wide_secret = wide(&secret);
+                let encoded = (|| {
+                    let mut blob = CRYPT_DATA_BLOB::default();
+                    api(
+                        PFXExportCertStoreEx(
+                            export_store.0,
+                            &mut blob,
+                            wide_secret.as_ptr(),
+                            ptr::null_mut(),
+                            EXPORT_PRIVATE_KEYS,
+                        ) != FALSE,
+                        (),
+                        "Size PFX export",
+                    )?;
+                    let mut encoded = vec![0u8; blob.cbData as usize];
+                    blob.pbData = encoded.as_mut_ptr();
+                    api(
+                        PFXExportCertStoreEx(
+                            export_store.0,
+                            &mut blob,
+                            wide_secret.as_ptr(),
+                            ptr::null_mut(),
+                            EXPORT_PRIVATE_KEYS,
+                        ) != FALSE,
+                        (),
+                        "Export PFX",
+                    )?;
+                    Ok::<_, String>(encoded)
+                })();
+                secret.zeroize();
+                let encoded = encoded?;
                 write_file(
                     Path::new(options.args.last().unwrap()),
                     &encoded,
@@ -1011,6 +1125,7 @@ fn execute(mut options: Options) -> Result<(), String> {
                 for index in &selected {
                     let entry = &contents[*index];
                     show(
+                        entry.context.0,
                         &entry.certificate,
                         entry.index,
                         options.verbose,
@@ -1027,7 +1142,7 @@ fn execute(mut options: Options) -> Result<(), String> {
                     } else if format == "pem" {
                         let mut output = Vec::new();
                         for index in &selected {
-                            output.extend(contents[*index].certificate.to_pem());
+                            output.extend(certificate_pem(&contents[*index].certificate)?);
                         }
                         output
                     } else {

@@ -463,6 +463,120 @@ fn pfx_import_and_private_material() {
     assert_eq!(fs::metadata(&key_path).unwrap().mode() & 0o777, 0o600);
     let recovered = PKey::private_key_from_pem(&fs::read(key_path).unwrap()).unwrap();
     assert!(recovered.public_eq(&leaf_key));
+
+    let name_size = CertGetNameStringA(
+        leaf_context.0,
+        CERT_NAME_RDN_TYPE,
+        0,
+        ptr::null(),
+        ptr::null_mut(),
+        0,
+    );
+    assert!(name_size > 1);
+    let mut name = vec![0i8; name_size as usize];
+    assert_eq!(
+        CertGetNameStringA(
+            leaf_context.0,
+            CERT_NAME_RDN_TYPE,
+            0,
+            ptr::null(),
+            name.as_mut_ptr(),
+            name_size,
+        ),
+        name_size
+    );
+    assert!(
+        unsafe { CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .contains("PFX leaf")
+    );
+
+    let parameters = CERT_CHAIN_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as DWORD,
+        ..CERT_CHAIN_PARA::default()
+    };
+    let mut chain_context = ptr::null();
+    assert_ok(CertGetCertificateChain(
+        ptr::null_mut(),
+        leaf_context.0,
+        ptr::null(),
+        store.0,
+        &parameters,
+        0,
+        ptr::null_mut(),
+        &mut chain_context,
+    ));
+    assert!(!chain_context.is_null());
+    unsafe {
+        assert_eq!((*chain_context).cChain, 1);
+        assert_eq!((**(*chain_context).rgpChain).cElement, 2);
+    }
+    let policy_parameters = CERT_CHAIN_POLICY_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as DWORD,
+        ..CERT_CHAIN_POLICY_PARA::default()
+    };
+    let mut policy_status = CERT_CHAIN_POLICY_STATUS {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as DWORD,
+        ..CERT_CHAIN_POLICY_STATUS::default()
+    };
+    assert_ok(CertVerifyCertificateChainPolicy(
+        CERT_CHAIN_POLICY_BASE as LPCSTR,
+        chain_context,
+        &policy_parameters,
+        &mut policy_status,
+    ));
+    assert_eq!(policy_status.dwError, ERROR_SUCCESS);
+    CertFreeCertificateChain(chain_context);
+
+    let mut exported = CRYPT_DATA_BLOB::default();
+    assert_ok(PFXExportCertStoreEx(
+        store.0,
+        &mut exported,
+        password.as_ptr(),
+        ptr::null_mut(),
+        EXPORT_PRIVATE_KEYS,
+    ));
+    let mut exported_bytes = vec![0u8; exported.cbData as usize];
+    exported.pbData = exported_bytes.as_mut_ptr();
+    assert_ok(PFXExportCertStoreEx(
+        store.0,
+        &mut exported,
+        password.as_ptr(),
+        ptr::null_mut(),
+        EXPORT_PRIVATE_KEYS,
+    ));
+    let exported_pfx = Pkcs12::from_der(&exported_bytes).unwrap();
+    let exported_material = exported_pfx.parse2("password").unwrap();
+    assert!(exported_material.pkey.unwrap().public_eq(&leaf_key));
+    assert_eq!(exported_material.ca.unwrap().len(), 1);
+
+    let mut pkcs7 = CRYPT_DATA_BLOB::default();
+    assert_ok(CertSaveStore(
+        store.0,
+        PKCS_7_ASN_ENCODING,
+        CERT_STORE_SAVE_AS_PKCS7,
+        CERT_STORE_SAVE_TO_MEMORY,
+        (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
+        0,
+    ));
+    let mut pkcs7_bytes = vec![0u8; pkcs7.cbData as usize];
+    pkcs7.pbData = pkcs7_bytes.as_mut_ptr();
+    assert_ok(CertSaveStore(
+        store.0,
+        PKCS_7_ASN_ENCODING,
+        CERT_STORE_SAVE_AS_PKCS7,
+        CERT_STORE_SAVE_TO_MEMORY,
+        (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
+        0,
+    ));
+    let pkcs7_store = Store::new(CertOpenStore(
+        PROVIDER_PKCS7 as LPCSTR,
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+        0,
+        CERT_STORE_READONLY_FLAG,
+        (&pkcs7 as *const CRYPT_DATA_BLOB).cast(),
+    ));
+    assert_eq!(count(&pkcs7_store), 2);
 }
 
 #[test]
@@ -791,6 +905,100 @@ fn certutil_commands_and_failures() {
     assert!(list.status.success());
     let output = String::from_utf8_lossy(&list.stdout);
     assert!(output.contains("Tool Root") && output.contains("1 certificate(s)"));
+
+    let pfx_key = key();
+    let pfx_certificate = certificate(&pfx_key, 101, "Tool PFX", false, None, -60, None);
+    let mut builder = Pkcs12::builder();
+    builder.name("tool");
+    builder.pkey(&pfx_key);
+    builder.cert(&pfx_certificate);
+    let pfx = builder.build2("password").unwrap().to_der().unwrap();
+    let input_pfx = temp.path().join("input.pfx");
+    fs::write(&input_pfx, pfx).unwrap();
+    let import = Command::new(env!("CARGO_BIN_EXE_certutil"))
+        .args(["--user-store-dir"])
+        .arg(temp.path().join("user"))
+        .args(["--machine-store-dir"])
+        .arg(temp.path().join("machine"))
+        .args(["--system-root"])
+        .arg(temp.path().join("system"))
+        .args(["-user", "-p", "password", "-importPFX", "MY"])
+        .arg(&input_pfx)
+        .output()
+        .unwrap();
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let output_pfx = temp.path().join("output.pfx");
+    let export = Command::new(env!("CARGO_BIN_EXE_certutil"))
+        .args(["--user-store-dir"])
+        .arg(temp.path().join("user"))
+        .args(["--machine-store-dir"])
+        .arg(temp.path().join("machine"))
+        .args(["--system-root"])
+        .arg(temp.path().join("system"))
+        .args([
+            "-user",
+            "-f",
+            "-p",
+            "password",
+            "-exportPFX",
+            "MY",
+            "subject:Tool PFX",
+        ])
+        .arg(&output_pfx)
+        .arg("NoChain")
+        .output()
+        .unwrap();
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let exported = Pkcs12::from_der(&fs::read(output_pfx).unwrap())
+        .unwrap()
+        .parse2("password")
+        .unwrap();
+    assert!(exported.pkey.unwrap().public_eq(&pfx_key));
+
+    let pkcs7_path = temp.path().join("store.p7b");
+    let save_pkcs7 = Command::new(env!("CARGO_BIN_EXE_certutil"))
+        .args(["--user-store-dir"])
+        .arg(temp.path().join("user"))
+        .args(["--machine-store-dir"])
+        .arg(temp.path().join("machine"))
+        .args(["--system-root"])
+        .arg(temp.path().join("system"))
+        .args(["-user", "-f", "--format", "pkcs7", "-store", "MY", "*"])
+        .arg(&pkcs7_path)
+        .output()
+        .unwrap();
+    assert!(
+        save_pkcs7.status.success(),
+        "{}",
+        String::from_utf8_lossy(&save_pkcs7.stderr)
+    );
+    let dump_pkcs7 = Command::new(env!("CARGO_BIN_EXE_certutil"))
+        .args(["--user-store-dir"])
+        .arg(temp.path().join("user"))
+        .args(["--machine-store-dir"])
+        .arg(temp.path().join("machine"))
+        .args(["--system-root"])
+        .arg(temp.path().join("system"))
+        .arg("-dump")
+        .arg(&pkcs7_path)
+        .output()
+        .unwrap();
+    assert!(
+        dump_pkcs7.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dump_pkcs7.stderr)
+    );
+    let dumped = String::from_utf8_lossy(&dump_pkcs7.stdout);
+    assert!(dumped.contains("Tool Root") && dumped.contains("Tool PFX"));
+
     let bad = run_certutil(&temp, &["-unknown"]);
     assert_eq!(bad.status.code(), Some(2));
 }

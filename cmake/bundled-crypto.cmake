@@ -44,7 +44,7 @@ ExternalProject_Add(scs-openssl-build
         ${openssl_mode} no-shared no-module no-dso no-tests -fPIC ${openssl_flags}
         "--prefix=${openssl_install}" "--openssldir=${openssl_install}/ssl" --libdir=lib
     BUILD_COMMAND "${SCS_MAKE}" -j2 build_libs
-    BUILD_ALWAYS TRUE
+    BUILD_ALWAYS FALSE
     INSTALL_COMMAND "${SCS_MAKE}" install_dev
     BUILD_BYPRODUCTS "${openssl_install}/lib/libcrypto.a"
     LOG_CONFIGURE ON LOG_BUILD ON LOG_INSTALL ON
@@ -88,7 +88,7 @@ ExternalProject_Add(scs-symcrypt-build
     BUILD_COMMAND "${CMAKE_COMMAND}" -E env ${symcrypt_environment}
         "${CMAKE_COMMAND}" --build <BINARY_DIR> --parallel 2
         --target symcrypt_posixusermode
-    INSTALL_COMMAND "" BUILD_ALWAYS TRUE
+    INSTALL_COMMAND "" BUILD_ALWAYS FALSE
     BUILD_BYPRODUCTS "${symcrypt_build}/lib/libsymcrypt_posixusermode.a"
         "${symcrypt_build}/lib/libsymcrypt_common.a" "${symcrypt_build}/lib/libsymcrypt_mlkem.a"
     LOG_CONFIGURE ON LOG_BUILD ON LOG_OUTPUT_ON_FAILURE ON)

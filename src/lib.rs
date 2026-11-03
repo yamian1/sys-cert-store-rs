@@ -15,13 +15,23 @@ use crate::error::{ApiError, boundary, last_error, message_ptr, require, set_err
 use crate::key::PrivateKey;
 use crate::native::{native_layout, remove_trusted_certificate, update_anchor};
 use crate::store::*;
+use base64ct::{Base64, Encoding};
+use cms::cert::CertificateChoices;
 use cms::content_info::ContentInfo;
+use cms::signed_data::SignedData;
 use der::{Decode, Encode};
 use libc::{c_char, c_void};
+use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
-use p12_keystore::{KeyStore, KeyStoreEntry, Pkcs12ImportPolicy};
+use openssl::pkey::PKey;
+use openssl::stack::Stack;
+use openssl::x509::X509;
+use p12_keystore::{
+    Certificate as P12Certificate, KeyStore, KeyStoreEntry, Pkcs12ImportPolicy,
+    PrivateKey as P12PrivateKey, PrivateKeyChain,
+};
 use rusqlite::OptionalExtension;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::CStr;
 use std::fs;
 use std::path::PathBuf;
@@ -88,6 +98,114 @@ fn copy_out(value: &[u8], data: *mut c_void, size: *mut DWORD) -> Result<(), Api
     Ok(())
 }
 
+fn copy_string_a(value: &str, output: *mut c_char, capacity: DWORD) -> Result<DWORD, ApiError> {
+    let required = dword(value.len() + 1)?;
+    if output.is_null() {
+        return Ok(required);
+    }
+    require(
+        capacity >= required,
+        ERROR_MORE_DATA,
+        "Output string buffer is too small",
+    )?;
+    unsafe {
+        ptr::copy_nonoverlapping(value.as_ptr(), output.cast(), value.len());
+        *output.add(value.len()) = 0;
+    }
+    Ok(required)
+}
+
+fn pem_payload(value: &str) -> Result<(&str, DWORD), ApiError> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with("-----BEGIN ") {
+        return Ok((trimmed, 0));
+    }
+    let first = trimmed
+        .find('\n')
+        .ok_or_else(|| ApiError::new(ERROR_INVALID_DATA, "Truncated PEM header"))?;
+    let last = trimmed
+        .rfind("-----END ")
+        .ok_or_else(|| ApiError::new(ERROR_INVALID_DATA, "Truncated PEM footer"))?;
+    require(last > first, ERROR_INVALID_DATA, "Invalid PEM boundaries")?;
+    Ok((trimmed[first + 1..last].trim(), first as DWORD + 1))
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, ApiError> {
+    let compact = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    let compact = std::str::from_utf8(&compact)
+        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid base64 text"))?;
+    Base64::decode_vec(compact)
+        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid base64 encoding"))
+}
+
+#[allow(clippy::vec_box)]
+fn parse_pkcs7(data: &[u8]) -> Result<Vec<Box<Context>>, ApiError> {
+    let content = ContentInfo::from_der(data)
+        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#7 container"))?;
+    require(
+        content.content_type == const_oid::db::rfc5911::ID_SIGNED_DATA,
+        ERROR_NOT_SUPPORTED,
+        "Only signed-data PKCS#7 certificate containers are supported",
+    )?;
+    let signed =
+        SignedData::from_der(&content.content.to_der().map_err(|_| {
+            ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#7 signed-data content")
+        })?)
+        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#7 signed-data content"))?;
+    let certificates = signed
+        .certificates
+        .ok_or_else(|| ApiError::new(CRYPT_E_NOT_FOUND, "PKCS#7 contains no certificates"))?
+        .0
+        .iter()
+        .filter_map(|value| match value {
+            CertificateChoices::Certificate(certificate) => Some(
+                certificate
+                    .to_der()
+                    .map_err(|_| {
+                        ApiError::new(
+                            ERROR_INVALID_DATA,
+                            "Invalid certificate in PKCS#7 container",
+                        )
+                    })
+                    .and_then(Context::new),
+            ),
+            CertificateChoices::Other(_) => None,
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    require(
+        !certificates.is_empty(),
+        CRYPT_E_NOT_FOUND,
+        "PKCS#7 contains no certificates",
+    )?;
+
+    let mut remaining = certificates
+        .into_iter()
+        .map(|certificate| {
+            let subject = certificate.certificate.subject_raw()?;
+            let issuer = certificate.certificate.issuer_raw()?;
+            Ok((certificate, subject, issuer))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let next = remaining
+            .iter()
+            .enumerate()
+            .position(|(index, (_, _, issuer))| {
+                !remaining
+                    .iter()
+                    .enumerate()
+                    .any(|(other, (_, subject, _))| other != index && subject == issuer)
+            })
+            .unwrap_or(0);
+        ordered.push(remaining.remove(next).0);
+    }
+    Ok(ordered)
+}
+
 fn refresh_context(state: &mut State, pointer: *const CERT_CONTEXT) -> Result<(), ApiError> {
     let (store_id, row) = {
         let context = state.context(pointer)?;
@@ -118,6 +236,7 @@ fn parse_provider(provider: LPCSTR) -> Result<Provider, ApiError> {
     let id = provider as usize;
     match id {
         PROVIDER_MEMORY => Ok(Provider::Memory),
+        PROVIDER_PKCS7 => Ok(Provider::Pkcs7),
         PROVIDER_SYSTEM_A => Ok(Provider::SystemA),
         PROVIDER_SYSTEM_W => Ok(Provider::SystemW),
         value if value > 0xffff => {
@@ -199,8 +318,38 @@ unsafe fn open_store_api(
                 (None, root)
             }
         }
-        Provider::Memory => (None, None),
+        Provider::Memory | Provider::Pkcs7 => (None, None),
     };
+    if matches!(provider, Provider::Pkcs7) {
+        require(
+            encoding & PKCS_7_ASN_ENCODING != 0,
+            ERROR_NOT_SUPPORTED,
+            "PKCS#7 stores require PKCS_7_ASN_ENCODING",
+        )?;
+        require(!parameter.is_null(), E_INVALIDARG, "Missing PKCS#7 blob")?;
+        let certificates = parse_pkcs7(blob_slice(unsafe {
+            &*parameter.cast::<CRYPT_DATA_BLOB>()
+        })?)?;
+        let mut state = STATE.lock();
+        let handle = open_store(
+            &mut state,
+            Provider::Memory,
+            flags & !CERT_STORE_READONLY_FLAG,
+            None,
+            None,
+        )?;
+        for certificate in &certificates {
+            add_context(
+                &mut state,
+                handle,
+                certificate,
+                CERT_STORE_ADD_ALWAYS,
+                false,
+            )?;
+        }
+        state.store_mut(handle)?.readonly = flags & CERT_STORE_READONLY_FLAG != 0;
+        return Ok(handle);
+    }
     open_store(
         &mut STATE.lock(),
         provider,
@@ -828,6 +977,134 @@ fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), Ap
     Ok(())
 }
 
+#[allow(clippy::vec_box)]
+fn export_contexts(handle: HCERTSTORE) -> Result<Vec<Box<Context>>, ApiError> {
+    let mut state = STATE.lock();
+    let view_id = store_key(handle);
+    let mut source_ids = vec![view_id];
+    source_ids.extend(state.store(handle)?.inherited.clone());
+    let mut contexts = Vec::new();
+    for id in source_ids {
+        let store = state.stores.get_mut(&id).unwrap();
+        materialize(store, false)?;
+        let rows = {
+            let mut statement = store
+                .db
+                .prepare("SELECT id FROM certificates ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for row in rows {
+            let mut context = load_context(store, row)?;
+            load_private_key(&mut context)?;
+            contexts.push(context);
+        }
+    }
+    require(
+        !contexts.is_empty(),
+        CRYPT_E_NOT_FOUND,
+        "Certificate store is empty",
+    )?;
+    Ok(contexts)
+}
+
+fn encode_pfx(handle: HCERTSTORE, secret: &str, flags: DWORD) -> Result<Vec<u8>, ApiError> {
+    require(
+        flags
+            & !(REPORT_NO_PRIVATE_KEY
+                | REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY
+                | EXPORT_PRIVATE_KEYS)
+            == 0,
+        ERROR_NOT_SUPPORTED,
+        "PKCS#12 export flags are unsupported",
+    )?;
+    let contexts = export_contexts(handle)?;
+    let key_indices = contexts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, context)| context.private_key.as_ref().map(|_| index))
+        .collect::<Vec<_>>();
+    if flags & EXPORT_PRIVATE_KEYS != 0 {
+        require(
+            key_indices.len() == 1,
+            if key_indices.is_empty() {
+                CRYPT_E_NOT_FOUND
+            } else {
+                ERROR_NOT_SUPPORTED
+            },
+            if key_indices.is_empty() {
+                "Certificate store contains no private key"
+            } else {
+                "PKCS#12 export with multiple private keys is unsupported"
+            },
+        )?;
+    }
+
+    let key_index = key_indices.first().copied();
+    if let Some(key_index) = key_index
+        && flags & EXPORT_PRIVATE_KEYS != 0
+        && contexts[key_index].private_key.as_ref().unwrap().is_pqc()
+    {
+        let key = contexts[key_index].private_key.as_ref().unwrap();
+        let key = PKey::private_key_from_der(key.to_der()).map_err(ApiError::from)?;
+        let certificate = X509::from_der(&contexts[key_index].der)?;
+        let mut stack = Stack::new()?;
+        for (index, issuer) in contexts.iter().enumerate() {
+            if index != key_index {
+                stack.push(X509::from_der(&issuer.der)?)?;
+            }
+        }
+        let mut builder = Pkcs12::builder();
+        builder
+            .pkey(&key)
+            .cert(&certificate)
+            .ca(stack)
+            .key_algorithm(Nid::AES_256_CBC)
+            .cert_algorithm(Nid::AES_256_CBC);
+        return builder
+            .build2(secret)
+            .and_then(|pfx| pfx.to_der())
+            .map_err(ApiError::from);
+    }
+
+    let mut keystore = KeyStore::new();
+    if let Some(key_index) = key_index.filter(|_| flags & EXPORT_PRIVATE_KEYS != 0) {
+        let ordered = std::iter::once(&contexts[key_index])
+            .chain(
+                contexts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, context)| (index != key_index).then_some(context)),
+            )
+            .map(|context| P12Certificate::from_der(&context.der))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))?;
+        let key = contexts[key_index].private_key.as_ref().unwrap();
+        let private_key = P12PrivateKey::from_der(key.to_der())
+            .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))?;
+        let chain = PrivateKeyChain::new(
+            contexts[key_index].certificate.sha1_fingerprint(),
+            private_key,
+            ordered,
+        );
+        keystore.add_entry("sys-cert-store", KeyStoreEntry::PrivateKeyChain(chain));
+    } else {
+        for (index, context) in contexts.iter().enumerate() {
+            let certificate = P12Certificate::from_der(&context.der)
+                .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))?;
+            keystore.add_entry(
+                &format!("certificate-{index}"),
+                KeyStoreEntry::Certificate(certificate),
+            );
+        }
+    }
+    keystore
+        .writer(secret)
+        .write()
+        .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))
+}
+
 pub fn GetLastError() -> DWORD {
     last_error()
 }
@@ -838,6 +1115,157 @@ pub fn SetLastError(error: DWORD) {
 
 pub fn SysCertGetLastErrorMessage() -> *const c_char {
     message_ptr()
+}
+
+pub fn CryptStringToBinaryA(
+    string: LPCSTR,
+    string_length: DWORD,
+    flags: DWORD,
+    binary: *mut BYTE,
+    binary_size: *mut DWORD,
+    skipped: *mut DWORD,
+    actual_flags: *mut DWORD,
+) -> BOOL {
+    boundary(FALSE, || {
+        require(!string.is_null(), E_INVALIDARG, "Null encoded string")?;
+        require(
+            matches!(
+                flags,
+                CRYPT_STRING_BASE64HEADER
+                    | CRYPT_STRING_BASE64
+                    | CRYPT_STRING_BASE64_ANY
+                    | CRYPT_STRING_ANY
+            ),
+            ERROR_NOT_SUPPORTED,
+            "String encoding flags are unsupported",
+        )?;
+        let value = if string_length == 0 {
+            unsafe { CStr::from_ptr(string) }
+                .to_str()
+                .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Encoded text is not UTF-8"))?
+                .to_owned()
+        } else {
+            std::str::from_utf8(unsafe {
+                std::slice::from_raw_parts(string.cast::<u8>(), string_length as usize)
+            })
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Encoded text is not UTF-8"))?
+            .to_owned()
+        };
+        let (payload, skip) = pem_payload(&value)?;
+        let decoded = decode_base64(payload)?;
+        if !skipped.is_null() {
+            unsafe { *skipped = skip };
+        }
+        if !actual_flags.is_null() {
+            unsafe {
+                *actual_flags = if skip == 0 {
+                    CRYPT_STRING_BASE64
+                } else {
+                    CRYPT_STRING_BASE64HEADER
+                }
+            };
+        }
+        copy_out(&decoded, binary.cast(), binary_size)?;
+        Ok(TRUE)
+    })
+}
+
+pub fn CryptBinaryToStringA(
+    binary: *const BYTE,
+    binary_size: DWORD,
+    flags: DWORD,
+    string: *mut c_char,
+    string_size: *mut DWORD,
+) -> BOOL {
+    boundary(FALSE, || {
+        require(
+            flags == CRYPT_STRING_BASE64HEADER || flags == CRYPT_STRING_BASE64,
+            ERROR_NOT_SUPPORTED,
+            "Binary string encoding flags are unsupported",
+        )?;
+        require(!string_size.is_null(), E_INVALIDARG, "Null output size")?;
+        let encoded = Base64::encode_string(&unsafe { bytes(binary, binary_size as usize) }?);
+        let mut value = String::new();
+        if flags == CRYPT_STRING_BASE64HEADER {
+            value.push_str("-----BEGIN CERTIFICATE-----\n");
+        }
+        for line in encoded.as_bytes().chunks(64) {
+            value.push_str(std::str::from_utf8(line).unwrap());
+            value.push('\n');
+        }
+        if flags == CRYPT_STRING_BASE64HEADER {
+            value.push_str("-----END CERTIFICATE-----\n");
+        }
+        let required = dword(value.len() + 1)?;
+        let capacity = unsafe { *string_size };
+        unsafe { *string_size = required };
+        if string.is_null() {
+            return Ok(TRUE);
+        }
+        require(
+            capacity >= required,
+            ERROR_MORE_DATA,
+            "Output string buffer is too small",
+        )?;
+        unsafe {
+            ptr::copy_nonoverlapping(value.as_ptr(), string.cast(), value.len());
+            *string.add(value.len()) = 0;
+        }
+        Ok(TRUE)
+    })
+}
+
+pub fn CertNameToStrA(
+    encoding: DWORD,
+    name: *const CERT_NAME_BLOB,
+    string_type: DWORD,
+    output: *mut c_char,
+    output_size: DWORD,
+) -> DWORD {
+    boundary(0, || {
+        encoding_check(encoding)?;
+        require(!name.is_null(), E_INVALIDARG, "Null encoded name")?;
+        require(
+            string_type & 0xff == CERT_X500_NAME_STR,
+            ERROR_NOT_SUPPORTED,
+            "Name string format is unsupported",
+        )?;
+        let data = blob_slice(unsafe { &*name })?;
+        let (remaining, parsed) = NativeX509Name::from_der(data)
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid encoded name"))?;
+        require(
+            remaining.is_empty(),
+            ERROR_INVALID_DATA,
+            "Invalid encoded name or trailing bytes",
+        )?;
+        copy_string_a(&parsed.to_string(), output, output_size)
+    })
+}
+
+pub fn CertGetNameStringA(
+    certificate: *const CERT_CONTEXT,
+    name_type: DWORD,
+    flags: DWORD,
+    type_parameter: *const c_void,
+    output: *mut c_char,
+    output_size: DWORD,
+) -> DWORD {
+    boundary(0, || {
+        require(
+            name_type == CERT_NAME_RDN_TYPE || name_type == CERT_NAME_SIMPLE_DISPLAY_TYPE,
+            ERROR_NOT_SUPPORTED,
+            "Certificate name type is unsupported",
+        )?;
+        require(
+            flags & !CERT_NAME_ISSUER_FLAG == 0 && type_parameter.is_null(),
+            ERROR_NOT_SUPPORTED,
+            "Certificate name options are unsupported",
+        )?;
+        let state = STATE.lock();
+        let context = state.context(certificate)?;
+        let value = Context::simple_name(&context.certificate, flags & CERT_NAME_ISSUER_FLAG == 0)?;
+        copy_string_a(&value, output, output_size)
+    })
 }
 
 pub fn SysCertConfigureSystemStores(configuration: *const SYS_CERT_STORE_CONFIGURATION) -> BOOL {
@@ -1533,6 +1961,210 @@ pub fn CertSaveStore(
     })
 }
 
+#[repr(C)]
+struct OwnedChain {
+    public: CERT_CHAIN_CONTEXT,
+    simple: Box<CERT_SIMPLE_CHAIN>,
+    chain_pointers: Box<[*mut CERT_SIMPLE_CHAIN]>,
+    elements: Box<[CERT_CHAIN_ELEMENT]>,
+    element_pointers: Box<[*mut CERT_CHAIN_ELEMENT]>,
+    contexts: Vec<*const CERT_CONTEXT>,
+}
+
+fn chain_candidates(
+    state: &mut State,
+    handle: HCERTSTORE,
+) -> Result<Vec<crate::cert::Certificate>, ApiError> {
+    if handle.is_null() {
+        return Ok(Vec::new());
+    }
+    let view_id = store_key(handle);
+    let mut source_ids = vec![view_id];
+    source_ids.extend(state.store(handle)?.inherited.clone());
+    let mut result = Vec::new();
+    for id in source_ids {
+        let store = state.stores.get_mut(&id).unwrap();
+        materialize(store, false)?;
+        let rows = {
+            let mut statement = store
+                .db
+                .prepare("SELECT id FROM certificates ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for row in rows {
+            result.push(load_context(store, row)?.certificate);
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn CertGetCertificateChain(
+    chain_engine: HCERTCHAINENGINE,
+    certificate: *const CERT_CONTEXT,
+    time: *const FILETIME,
+    additional_store: HCERTSTORE,
+    parameters: *const CERT_CHAIN_PARA,
+    flags: DWORD,
+    reserved: *mut c_void,
+    chain_context: *mut *const CERT_CHAIN_CONTEXT,
+) -> BOOL {
+    boundary(FALSE, || {
+        require(
+            chain_engine.is_null()
+                && time.is_null()
+                && flags == 0
+                && reserved.is_null()
+                && !parameters.is_null()
+                && !chain_context.is_null(),
+            ERROR_NOT_SUPPORTED,
+            "Only default offline certificate-chain construction is supported",
+        )?;
+        let parameters = unsafe { &*parameters };
+        require(
+            parameters.cbSize as usize == std::mem::size_of::<CERT_CHAIN_PARA>()
+                && parameters.RequestedUsage.Usage.cUsageIdentifier == 0
+                && parameters.RequestedIssuancePolicy.Usage.cUsageIdentifier == 0
+                && parameters.dwUrlRetrievalTimeout == 0
+                && parameters.fCheckRevocationFreshnessTime == FALSE
+                && parameters.dwRevocationFreshnessTime == 0
+                && parameters.pftCacheResync.is_null()
+                && parameters.pStrongSignPara.is_null()
+                && parameters.dwStrongSignFlags == 0,
+            ERROR_NOT_SUPPORTED,
+            "Certificate-chain parameters are unsupported",
+        )?;
+
+        let mut state = STATE.lock();
+        let leaf = state.context(certificate)?.certificate.clone();
+        let candidates = chain_candidates(&mut state, additional_store)?;
+        let mut certificates = vec![leaf.clone()];
+        let mut seen = HashSet::from([hex::encode(leaf.sha256_fingerprint())]);
+        let mut current = leaf;
+        while !current.self_signed()? {
+            let mut issuers = BTreeMap::new();
+            for candidate in &candidates {
+                if candidate.subject_raw()? == current.issuer_raw()?
+                    && current.verify_with(candidate)?
+                {
+                    issuers.insert(
+                        hex::encode(candidate.sha256_fingerprint()),
+                        candidate.clone(),
+                    );
+                }
+            }
+            require(
+                issuers.len() == 1,
+                CRYPT_E_NO_MATCH,
+                "Cannot build an unambiguous complete offline issuer chain",
+            )?;
+            let (hash, issuer) = issuers.pop_first().unwrap();
+            require(
+                seen.insert(hash),
+                ERROR_INVALID_DATA,
+                "Cycle in certificate issuer chain",
+            )?;
+            current = issuer.clone();
+            certificates.push(issuer);
+        }
+
+        state.context_mut(certificate)?.references += 1;
+        let mut context_pointers = vec![certificate];
+        for issuer in certificates.iter().skip(1) {
+            let context = Context::new(issuer.to_der())?;
+            context_pointers.push(state.publish_context(context, None, 0, None));
+        }
+        drop(state);
+
+        let mut elements = context_pointers
+            .iter()
+            .map(|context| CERT_CHAIN_ELEMENT {
+                cbSize: std::mem::size_of::<CERT_CHAIN_ELEMENT>() as DWORD,
+                pCertContext: *context,
+                ..CERT_CHAIN_ELEMENT::default()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut element_pointers = elements
+            .iter_mut()
+            .map(|element| element as *mut CERT_CHAIN_ELEMENT)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut simple = Box::new(CERT_SIMPLE_CHAIN {
+            cbSize: std::mem::size_of::<CERT_SIMPLE_CHAIN>() as DWORD,
+            cElement: dword(element_pointers.len())?,
+            rgpElement: element_pointers.as_mut_ptr(),
+            ..CERT_SIMPLE_CHAIN::default()
+        });
+        let mut chain_pointers = vec![simple.as_mut() as *mut CERT_SIMPLE_CHAIN].into_boxed_slice();
+        let public = CERT_CHAIN_CONTEXT {
+            cbSize: std::mem::size_of::<CERT_CHAIN_CONTEXT>() as DWORD,
+            cChain: 1,
+            rgpChain: chain_pointers.as_mut_ptr(),
+            ..CERT_CHAIN_CONTEXT::default()
+        };
+        let owned = Box::new(OwnedChain {
+            public,
+            simple,
+            chain_pointers,
+            elements,
+            element_pointers,
+            contexts: context_pointers,
+        });
+        let raw = Box::into_raw(owned);
+        unsafe {
+            *chain_context = &(*raw).public;
+        }
+        Ok(TRUE)
+    })
+}
+
+pub fn CertFreeCertificateChain(chain: *const CERT_CHAIN_CONTEXT) {
+    if chain.is_null() {
+        return;
+    }
+    let owned = unsafe { Box::from_raw(chain.cast_mut().cast::<OwnedChain>()) };
+    let mut state = STATE.lock();
+    for context in &owned.contexts {
+        let _ = state.release_context(*context);
+    }
+}
+
+pub fn CertVerifyCertificateChainPolicy(
+    policy: LPCSTR,
+    chain: *const CERT_CHAIN_CONTEXT,
+    parameters: *const CERT_CHAIN_POLICY_PARA,
+    status: *mut CERT_CHAIN_POLICY_STATUS,
+) -> BOOL {
+    boundary(FALSE, || {
+        require(
+            policy as usize == CERT_CHAIN_POLICY_BASE
+                && !chain.is_null()
+                && !parameters.is_null()
+                && !status.is_null(),
+            E_INVALIDARG,
+            "Invalid certificate-chain policy arguments",
+        )?;
+        let parameters = unsafe { &*parameters };
+        let status = unsafe { &mut *status };
+        require(
+            parameters.cbSize as usize == std::mem::size_of::<CERT_CHAIN_POLICY_PARA>()
+                && parameters.dwFlags == 0
+                && parameters.pvExtraPolicyPara.is_null()
+                && status.cbSize as usize == std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>()
+                && status.pvExtraPolicyStatus.is_null(),
+            ERROR_NOT_SUPPORTED,
+            "Certificate-chain policy options are unsupported",
+        )?;
+        status.dwError = unsafe { (*chain).TrustStatus.dwErrorStatus };
+        status.lChainIndex = -1;
+        status.lElementIndex = -1;
+        Ok(TRUE)
+    })
+}
+
 pub fn SysCertUpdateTrustAnchor(
     certificate: *const CERT_CONTEXT,
     install: BOOL,
@@ -1641,6 +2273,34 @@ pub fn PFXImportCertStore(
             import_pfx(store, &certificates)?;
         }
         Ok(handle)
+    })
+}
+
+pub fn PFXExportCertStoreEx(
+    handle: HCERTSTORE,
+    pfx: *mut CRYPT_DATA_BLOB,
+    password: LPCWSTR,
+    parameter: *mut c_void,
+    flags: DWORD,
+) -> BOOL {
+    boundary(FALSE, || {
+        require(!pfx.is_null(), E_INVALIDARG, "Missing PKCS#12 output blob")?;
+        require(
+            parameter.is_null(),
+            ERROR_NOT_SUPPORTED,
+            "PKCS#12 export parameters are unsupported",
+        )?;
+        let mut secret = if password.is_null() {
+            String::new()
+        } else {
+            unsafe { wide_string(password) }?
+        };
+        let encoded = encode_pfx(handle, &secret, flags);
+        secret.zeroize();
+        let encoded = encoded?;
+        let output = unsafe { &mut *pfx };
+        copy_out(&encoded, output.pbData.cast(), &mut output.cbData)?;
+        Ok(TRUE)
     })
 }
 

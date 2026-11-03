@@ -472,8 +472,10 @@ fn machine_backing(paths: &SystemPaths, name: &str, flags: DWORD) -> Result<Stor
     Ok(store)
 }
 
+#[derive(Clone, Copy)]
 pub enum Provider {
     Memory,
+    Pkcs7,
     SystemA,
     SystemW,
     Sqlite,
@@ -513,7 +515,7 @@ pub fn open_store(
     store.readonly = flags & CERT_STORE_READONLY_FLAG != 0;
     store.archived = flags & CERT_STORE_ENUM_ARCHIVED_FLAG != 0;
     match provider {
-        Provider::Memory => {
+        Provider::Memory | Provider::Pkcs7 => {
             require(
                 flags
                     & (0xff0000 | SYS_CERT_STORE_NATIVE_WRITE_FLAG | CERT_STORE_OPEN_EXISTING_FLAG)
