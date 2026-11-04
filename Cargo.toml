@@ -47,6 +47,7 @@ ureq = { version = "3", default-features = false }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_System_Services",
 ] }
 
 [dev-dependencies]

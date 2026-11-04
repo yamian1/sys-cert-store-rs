@@ -225,12 +225,7 @@ fn dotnet_process_accounts(failures: &mut FailureSummary) -> Result<Vec<Account>
         let base = entry.path();
         let maps = match fs::read_to_string(base.join("maps")) {
             Ok(value) => value,
-            Err(_) => {
-                if base.exists() {
-                    failures.add(format!("Cannot inspect {}/maps", base.display()));
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
         if !maps.lines().any(|line| line.contains("libcoreclr.so")) {
             continue;

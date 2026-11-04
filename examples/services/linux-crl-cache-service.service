@@ -1,0 +1,14 @@
+[Unit]
+Description=Prime .NET CRL caches from LocalMachine certificate stores
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/linux_crl_cache_service
+Restart=on-failure
+RestartSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target
