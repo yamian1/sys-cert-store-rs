@@ -1,4 +1,22 @@
 use std::env;
+use std::path::Path;
+
+fn link_bundled_archive(variable: &str) {
+    let value = env::var(variable)
+        .unwrap_or_else(|_| panic!("{variable} is required when SCS_BUNDLED_CRYPTO is set"));
+    let archive = Path::new(&value);
+    let directory = archive
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .unwrap_or_else(|| panic!("{variable} must include an archive directory"));
+    let filename = archive
+        .file_name()
+        .and_then(|filename| filename.to_str())
+        .unwrap_or_else(|| panic!("{variable} must name a UTF-8 archive file"));
+
+    println!("cargo:rustc-link-search=native={}", directory.display());
+    println!("cargo:rustc-link-lib=static:+bundle,+verbatim={filename}");
+}
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(scs_bundled_crypto)");
@@ -21,7 +39,6 @@ fn main() {
     }
 
     println!("cargo:rustc-cfg=scs_bundled_crypto");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
     for variable in [
         "SCS_CRYPTO_ARCHIVE",
         "SCS_SCOSSL_ARCHIVE",
@@ -32,11 +49,8 @@ fn main() {
         "SCS_JITTER_ARCHIVE",
         "SCS_OPENSSL_ARCHIVE",
     ] {
-        let archive = env::var(variable)
-            .unwrap_or_else(|_| panic!("{variable} is required when SCS_BUNDLED_CRYPTO is set"));
-        println!("cargo:rustc-link-arg={archive}");
+        link_bundled_archive(variable);
     }
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
     println!("cargo:rustc-link-arg=-Wl,--exclude-libs,ALL");
     println!("cargo:rustc-link-arg=-Wl,-z,noexecstack");
     println!("cargo:rustc-link-lib=dylib=stdc++");

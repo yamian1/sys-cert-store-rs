@@ -1,4 +1,4 @@
-foreach(binary "${TOOL}" "${EXAMPLE}")
+foreach(binary "${TOOL}" "${EXAMPLE}" "${CONSUMER}")
     if(NOT binary)
         continue()
     endif()
