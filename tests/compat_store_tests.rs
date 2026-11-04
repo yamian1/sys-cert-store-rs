@@ -8,7 +8,7 @@ use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
 use openssl::pkey::{PKey, Private};
 use openssl::stack::Stack;
-use openssl::x509::extension::BasicConstraints;
+use openssl::x509::extension::{BasicConstraints, KeyUsage};
 use openssl::x509::{X509, X509Extension, X509NameBuilder};
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -69,6 +69,33 @@ fn certificate(
     not_before_offset: i64,
     crl_url: Option<&str>,
 ) -> X509 {
+    certificate_with_options(
+        subject_key,
+        serial,
+        common_name,
+        ca,
+        None,
+        None,
+        issuer,
+        not_before_offset,
+        86_400,
+        crl_url,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certificate_with_options(
+    subject_key: &PKey<Private>,
+    serial: u32,
+    common_name: &str,
+    ca: bool,
+    path_length: Option<u32>,
+    key_cert_sign: Option<bool>,
+    issuer: Option<(&X509, &PKey<Private>)>,
+    not_before_offset: i64,
+    not_after_offset: i64,
+    crl_url: Option<&str>,
+) -> X509 {
     let mut builder = X509::builder().unwrap();
     builder.set_version(2).unwrap();
     let serial = Asn1Integer::from_bn(&BigNum::from_u32(serial).unwrap()).unwrap();
@@ -78,7 +105,7 @@ fn certificate(
         .unwrap()
         .as_secs() as i64;
     let not_before = Asn1Time::from_unix(now + not_before_offset).unwrap();
-    let not_after = Asn1Time::from_unix(now + 86_400).unwrap();
+    let not_after = Asn1Time::from_unix(now + not_after_offset).unwrap();
     builder.set_not_before(&not_before).unwrap();
     builder.set_not_after(&not_after).unwrap();
     builder.set_pubkey(subject_key).unwrap();
@@ -91,11 +118,26 @@ fn certificate(
         .set_issuer_name(issuer.map_or(name.as_ref(), |value| value.0.subject_name()))
         .unwrap();
     let constraints = if ca {
-        BasicConstraints::new().critical().ca().build().unwrap()
+        let mut constraints = BasicConstraints::new();
+        constraints.critical().ca();
+        if let Some(path_length) = path_length {
+            constraints.pathlen(path_length);
+        }
+        constraints.build().unwrap()
     } else {
         BasicConstraints::new().critical().build().unwrap()
     };
     builder.append_extension(constraints).unwrap();
+    if let Some(key_cert_sign) = key_cert_sign {
+        let mut usage = KeyUsage::new();
+        usage.critical();
+        if key_cert_sign {
+            usage.key_cert_sign().crl_sign();
+        } else {
+            usage.digital_signature();
+        }
+        builder.append_extension(usage.build().unwrap()).unwrap();
+    }
     if let Some(url) = crl_url {
         let context = builder.x509v3_context(issuer.map(|value| value.0.as_ref()), None);
         #[allow(deprecated)]
@@ -255,6 +297,57 @@ fn material_path(context: &Context, private_key: BOOL) -> PathBuf {
     });
     bytes.pop();
     PathBuf::from(String::from_utf8(bytes).unwrap())
+}
+
+fn build_chain(context: &Context, additional: Option<&Store>) -> *const CERT_CHAIN_CONTEXT {
+    let parameters = CERT_CHAIN_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as DWORD,
+        ..CERT_CHAIN_PARA::default()
+    };
+    let mut chain = ptr::null();
+    // SAFETY: the context, optional store, parameters, and output slot remain
+    // live for the synchronous chain build.
+    assert_ok(unsafe {
+        CertGetCertificateChain(
+            ptr::null_mut(),
+            context.0,
+            ptr::null(),
+            additional.map_or(ptr::null_mut(), |store| store.0),
+            &parameters,
+            0,
+            ptr::null_mut(),
+            &mut chain,
+        )
+    });
+    assert!(!chain.is_null());
+    chain
+}
+
+fn verify_base_policy(chain: *const CERT_CHAIN_CONTEXT) -> CERT_CHAIN_POLICY_STATUS {
+    let parameters = CERT_CHAIN_POLICY_PARA {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_PARA>() as DWORD,
+        ..CERT_CHAIN_POLICY_PARA::default()
+    };
+    let mut status = CERT_CHAIN_POLICY_STATUS {
+        cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as DWORD,
+        ..CERT_CHAIN_POLICY_STATUS::default()
+    };
+    // SAFETY: the chain and initialized policy input/output structures remain
+    // live for the synchronous policy check.
+    assert_ok(unsafe {
+        CertVerifyCertificateChainPolicy(
+            CERT_CHAIN_POLICY_BASE as LPCSTR,
+            chain,
+            &parameters,
+            &mut status,
+        )
+    });
+    status
+}
+
+fn free_chain(chain: *const CERT_CHAIN_CONTEXT) {
+    // SAFETY: each helper caller transfers one live chain exactly once.
+    unsafe { CertFreeCertificateChain(chain) };
 }
 
 #[test]
@@ -540,7 +633,9 @@ fn pfx_import_and_private_material() {
             &mut policy_status,
         )
     });
-    assert_eq!(policy_status.dwError, ERROR_SUCCESS);
+    assert_eq!(policy_status.dwError, CERT_E_UNTRUSTEDROOT);
+    assert_eq!(policy_status.lChainIndex, 0);
+    assert_eq!(policy_status.lElementIndex, 1);
     // SAFETY: `chain_context` is the live allocation returned above.
     unsafe { CertFreeCertificateChain(chain_context) };
 
@@ -610,6 +705,367 @@ fn pfx_import_and_private_material() {
         )
     });
     assert_eq!(count(&pkcs7_store), 2);
+}
+
+#[test]
+fn windows_compatible_chain_trust_and_policy_status() {
+    let _guard = api_lock();
+    let temp = TempDir::new().unwrap();
+    let now_offset = -10 * 86_400;
+    let expired_offset = -5 * 86_400;
+
+    let expired_trusted_key = key();
+    let expired_trusted = certificate_with_options(
+        &expired_trusted_key,
+        101,
+        "Expired Trusted Root",
+        true,
+        None,
+        Some(true),
+        None,
+        now_offset,
+        expired_offset,
+        None,
+    );
+    let expired_untrusted_key = key();
+    let expired_untrusted = certificate_with_options(
+        &expired_untrusted_key,
+        102,
+        "Expired Untrusted Root",
+        true,
+        None,
+        Some(true),
+        None,
+        now_offset,
+        expired_offset,
+        None,
+    );
+    let non_ca_key = key();
+    let non_ca = certificate_with_options(
+        &non_ca_key,
+        103,
+        "Not A CA",
+        false,
+        None,
+        Some(false),
+        None,
+        -60,
+        86_400,
+        None,
+    );
+    let non_ca_leaf_key = key();
+    let non_ca_leaf = certificate(
+        &non_ca_leaf_key,
+        104,
+        "Non-CA Issued Leaf",
+        false,
+        Some((&non_ca, &non_ca_key)),
+        -60,
+        None,
+    );
+    let path_root_key = key();
+    let path_root = certificate_with_options(
+        &path_root_key,
+        105,
+        "Path Length Root",
+        true,
+        Some(0),
+        Some(true),
+        None,
+        -60,
+        86_400,
+        None,
+    );
+    let intermediate_key = key();
+    let intermediate = certificate_with_options(
+        &intermediate_key,
+        106,
+        "Intermediate",
+        true,
+        None,
+        Some(true),
+        Some((&path_root, &path_root_key)),
+        -60,
+        86_400,
+        None,
+    );
+    let path_leaf_key = key();
+    let path_leaf = certificate(
+        &path_leaf_key,
+        107,
+        "Path Length Leaf",
+        false,
+        Some((&intermediate, &intermediate_key)),
+        -60,
+        None,
+    );
+    let missing_key = key();
+    let missing_issuer = certificate(&missing_key, 108, "Missing Issuer", true, None, -60, None);
+    let partial_leaf_key = key();
+    let partial_leaf = certificate(
+        &partial_leaf_key,
+        109,
+        "Partial Leaf",
+        false,
+        Some((&missing_issuer, &missing_key)),
+        -60,
+        None,
+    );
+    let no_sign_ca_key = key();
+    let no_sign_ca = certificate_with_options(
+        &no_sign_ca_key,
+        110,
+        "No Certificate Sign CA",
+        true,
+        None,
+        Some(false),
+        None,
+        -60,
+        86_400,
+        None,
+    );
+    let no_sign_leaf_key = key();
+    let no_sign_leaf = certificate(
+        &no_sign_leaf_key,
+        111,
+        "No Certificate Sign Leaf",
+        false,
+        Some((&no_sign_ca, &no_sign_ca_key)),
+        -60,
+        None,
+    );
+    let valid_root_key = key();
+    let valid_root = certificate_with_options(
+        &valid_root_key,
+        112,
+        "Valid Trusted Root",
+        true,
+        None,
+        Some(true),
+        None,
+        -60,
+        86_400,
+        None,
+    );
+    let signature_root_key = key();
+    let signature_root = certificate_with_options(
+        &signature_root_key,
+        113,
+        "Signature Root",
+        true,
+        None,
+        Some(true),
+        None,
+        -60,
+        86_400,
+        None,
+    );
+    let wrong_signing_key = key();
+    let invalid_signature_leaf_key = key();
+    let invalid_signature_leaf = certificate(
+        &invalid_signature_leaf_key,
+        114,
+        "Invalid Signature Leaf",
+        false,
+        Some((&signature_root, &wrong_signing_key)),
+        -60,
+        None,
+    );
+
+    let system = temp.path().join("system");
+    fs::create_dir_all(system.join("etc/ssl/certs")).unwrap();
+    fs::write(system.join("etc/os-release"), "ID=ubuntu\n").unwrap();
+    let mut trusted_bundle = Vec::new();
+    for certificate in [
+        &expired_trusted,
+        &non_ca,
+        &path_root,
+        &no_sign_ca,
+        &valid_root,
+        &signature_root,
+    ] {
+        trusted_bundle.extend(certificate.to_pem().unwrap());
+    }
+    fs::write(
+        system.join("etc/ssl/certs/ca-certificates.crt"),
+        trusted_bundle,
+    )
+    .unwrap();
+    let user = cstring(temp.path().join("user"));
+    let machine = cstring(temp.path().join("machine"));
+    let system_c = cstring(&system);
+    let configuration = SYS_CERT_STORE_CONFIGURATION {
+        cbSize: size_of::<SYS_CERT_STORE_CONFIGURATION>() as DWORD,
+        userStoreDirectory: user.as_ptr(),
+        machineStoreDirectory: machine.as_ptr(),
+        systemRoot: system_c.as_ptr(),
+    };
+    // SAFETY: the configuration and its strings remain live throughout this
+    // test, and no store survives the final reset.
+    assert_ok(unsafe { SysCertConfigureSystemStores(&configuration) });
+
+    {
+        let expired_untrusted = Context::from_x509(&expired_untrusted);
+        let chain = build_chain(&expired_untrusted, None);
+        // SAFETY: `chain` remains live until `free_chain`.
+        assert_eq!(
+            unsafe { (*chain).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_NOT_TIME_VALID | CERT_TRUST_IS_UNTRUSTED_ROOT
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (CERT_E_UNTRUSTEDROOT, 0, 0)
+        );
+        free_chain(chain);
+
+        let expired_trusted = Context::from_x509(&expired_trusted);
+        let chain = build_chain(&expired_trusted, None);
+        // SAFETY: `chain` remains live until `free_chain`.
+        assert_eq!(
+            unsafe { (*chain).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_NOT_TIME_VALID
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (CERT_E_EXPIRED, 0, 0)
+        );
+        free_chain(chain);
+
+        let candidates = Store::memory();
+        let non_ca_context = Context::from_x509(&non_ca);
+        let _non_ca_added = Context::add(&candidates, &non_ca_context, CERT_STORE_ADD_ALWAYS);
+        let non_ca_leaf = Context::from_x509(&non_ca_leaf);
+        let chain = build_chain(&non_ca_leaf, Some(&candidates));
+        // SAFETY: the chain and its first simple chain remain live.
+        let simple = unsafe { &**(*chain).rgpChain };
+        assert_eq!(
+            simple.TrustStatus.dwErrorStatus,
+            CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_BASIC_CONSTRAINTS
+        );
+        // SAFETY: the two-element chain has a live issuer element at index one.
+        assert_eq!(
+            unsafe { (**simple.rgpElement.add(1)).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_NOT_VALID_FOR_USAGE | CERT_TRUST_INVALID_BASIC_CONSTRAINTS
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (CERT_E_WRONG_USAGE, 0, 1)
+        );
+        free_chain(chain);
+
+        let no_sign_candidates = Store::memory();
+        let no_sign_ca_context = Context::from_x509(&no_sign_ca);
+        let _no_sign_ca_added = Context::add(
+            &no_sign_candidates,
+            &no_sign_ca_context,
+            CERT_STORE_ADD_ALWAYS,
+        );
+        let no_sign_leaf = Context::from_x509(&no_sign_leaf);
+        let chain = build_chain(&no_sign_leaf, Some(&no_sign_candidates));
+        // SAFETY: the chain and its two-element simple chain remain live.
+        let simple = unsafe { &**(*chain).rgpChain };
+        assert_eq!(
+            simple.TrustStatus.dwErrorStatus,
+            CERT_TRUST_IS_NOT_VALID_FOR_USAGE
+        );
+        // SAFETY: the issuer is the live element at index one.
+        assert_eq!(
+            unsafe { (**simple.rgpElement.add(1)).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_NOT_VALID_FOR_USAGE
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (CERT_E_WRONG_USAGE, 0, 1)
+        );
+        free_chain(chain);
+
+        let path_candidates = Store::memory();
+        let intermediate_context = Context::from_x509(&intermediate);
+        let _intermediate_added = Context::add(
+            &path_candidates,
+            &intermediate_context,
+            CERT_STORE_ADD_ALWAYS,
+        );
+        let path_leaf = Context::from_x509(&path_leaf);
+        let chain = build_chain(&path_leaf, Some(&path_candidates));
+        // SAFETY: the chain and its three-element simple chain remain live.
+        let simple = unsafe { &**(*chain).rgpChain };
+        assert_eq!(
+            simple.TrustStatus.dwErrorStatus,
+            CERT_TRUST_INVALID_BASIC_CONSTRAINTS
+        );
+        // SAFETY: the root is the live element at index two.
+        assert_eq!(
+            unsafe { (**simple.rgpElement.add(2)).TrustStatus.dwErrorStatus },
+            CERT_TRUST_INVALID_BASIC_CONSTRAINTS
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (TRUST_E_BASIC_CONSTRAINTS, 0, 2)
+        );
+        free_chain(chain);
+
+        let signature_candidates = Store::memory();
+        let signature_root_context = Context::from_x509(&signature_root);
+        let _signature_root_added = Context::add(
+            &signature_candidates,
+            &signature_root_context,
+            CERT_STORE_ADD_ALWAYS,
+        );
+        let invalid_signature_leaf = Context::from_x509(&invalid_signature_leaf);
+        let chain = build_chain(&invalid_signature_leaf, Some(&signature_candidates));
+        // SAFETY: the chain and its two-element simple chain remain live.
+        let simple = unsafe { &**(*chain).rgpChain };
+        assert_eq!(
+            simple.TrustStatus.dwErrorStatus,
+            CERT_TRUST_IS_NOT_SIGNATURE_VALID
+        );
+        // SAFETY: the leaf is the live element at index zero.
+        assert_eq!(
+            unsafe { (**simple.rgpElement).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_NOT_SIGNATURE_VALID
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (TRUST_E_CERT_SIGNATURE, 0, 0)
+        );
+        free_chain(chain);
+
+        let valid_root = Context::from_x509(&valid_root);
+        let chain = build_chain(&valid_root, None);
+        // SAFETY: `chain` remains live until `free_chain`.
+        assert_eq!(unsafe { (*chain).TrustStatus.dwErrorStatus }, 0);
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (ERROR_SUCCESS, -1, -1)
+        );
+        free_chain(chain);
+
+        let partial_leaf = Context::from_x509(&partial_leaf);
+        let chain = build_chain(&partial_leaf, None);
+        // SAFETY: `chain` remains live until `free_chain`.
+        assert_eq!(
+            unsafe { (*chain).TrustStatus.dwErrorStatus },
+            CERT_TRUST_IS_PARTIAL_CHAIN
+        );
+        let policy = verify_base_policy(chain);
+        assert_eq!(
+            (policy.dwError, policy.lChainIndex, policy.lElementIndex),
+            (CERT_E_CHAINING, 0, -1)
+        );
+        free_chain(chain);
+    }
+
+    // SAFETY: null restores default paths after every test-owned handle and
+    // context has been released.
+    assert_ok(unsafe { SysCertConfigureSystemStores(ptr::null()) });
 }
 
 #[test]

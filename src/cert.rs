@@ -179,12 +179,25 @@ impl Certificate {
     }
 
     pub fn is_ca(&self) -> Result<bool, ApiError> {
+        Ok(self.basic_constraints()?.is_some_and(|(is_ca, _)| is_ca))
+    }
+
+    pub fn basic_constraints(&self) -> Result<Option<(bool, Option<u32>)>, ApiError> {
         for extension in self.parsed()?.extensions() {
             if let ParsedExtension::BasicConstraints(constraints) = extension.parsed_extension() {
-                return Ok(constraints.ca);
+                return Ok(Some((constraints.ca, constraints.path_len_constraint)));
             }
         }
-        Ok(false)
+        Ok(None)
+    }
+
+    pub fn key_usage_allows_certificate_signing(&self) -> Result<Option<bool>, ApiError> {
+        for extension in self.parsed()?.extensions() {
+            if let ParsedExtension::KeyUsage(usage) = extension.parsed_extension() {
+                return Ok(Some(usage.key_cert_sign()));
+            }
+        }
+        Ok(None)
     }
 
     pub fn verify_with(&self, issuer: &Certificate) -> Result<bool, ApiError> {

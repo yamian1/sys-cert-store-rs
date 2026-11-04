@@ -2147,6 +2147,109 @@ fn chain_candidates(
     Ok(result)
 }
 
+fn remove_temporary_store(state: &mut State, handle: HCERTSTORE) {
+    if let Some(store) = state.stores.remove(&store_key(handle)) {
+        for inherited in store.inherited {
+            state.stores.remove(&inherited);
+        }
+    }
+}
+
+fn system_chain_candidates(
+    state: &mut State,
+    name: &str,
+) -> Result<Vec<crate::cert::Certificate>, ApiError> {
+    let handle = open_store(
+        state,
+        Provider::SystemW,
+        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_READONLY_FLAG,
+        Some(name.to_owned()),
+        None,
+    )?;
+    let result = chain_candidates(state, handle);
+    remove_temporary_store(state, handle);
+    result
+}
+
+fn insert_chain_candidates(
+    destination: &mut BTreeMap<String, crate::cert::Certificate>,
+    certificates: impl IntoIterator<Item = crate::cert::Certificate>,
+) {
+    for certificate in certificates {
+        destination
+            .entry(hex::encode(certificate.sha256_fingerprint()))
+            .or_insert(certificate);
+    }
+}
+
+fn chain_element_statuses(
+    certificates: &[crate::cert::Certificate],
+    trusted_roots: &HashSet<String>,
+    invalid_signatures: &HashSet<usize>,
+    partial: bool,
+    cyclic: bool,
+) -> Result<(Vec<CERT_TRUST_STATUS>, CERT_TRUST_STATUS), ApiError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ApiError::new(ERROR_GEN_FAILURE, "System time precedes the Unix epoch"))?
+        .as_secs() as i64;
+    let mut elements = vec![CERT_TRUST_STATUS::default(); certificates.len()];
+
+    for (index, certificate) in certificates.iter().enumerate() {
+        if now < certificate.not_before_timestamp()? || now > certificate.not_after_timestamp()? {
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_TIME_VALID;
+        }
+        if invalid_signatures.contains(&index) {
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_SIGNATURE_VALID;
+        }
+        if certificate.self_signed()? {
+            elements[index].dwInfoStatus |= CERT_TRUST_IS_SELF_SIGNED;
+        }
+        if index == 0 {
+            continue;
+        }
+
+        let constraints = certificate.basic_constraints()?;
+        let is_ca = constraints.is_some_and(|(is_ca, _)| is_ca);
+        if !is_ca {
+            elements[index].dwErrorStatus |=
+                CERT_TRUST_INVALID_BASIC_CONSTRAINTS | CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+        }
+        if certificate.key_usage_allows_certificate_signing()? == Some(false) {
+            elements[index].dwErrorStatus |= CERT_TRUST_IS_NOT_VALID_FOR_USAGE;
+        }
+        if let Some((true, Some(limit))) = constraints {
+            let mut subordinate_ca_count = 0;
+            for subordinate in &certificates[1..index] {
+                if subordinate.is_ca()? && subordinate.subject_raw()? != subordinate.issuer_raw()? {
+                    subordinate_ca_count += 1;
+                }
+            }
+            if subordinate_ca_count > limit as usize {
+                elements[index].dwErrorStatus |= CERT_TRUST_INVALID_BASIC_CONSTRAINTS;
+            }
+        }
+    }
+
+    let mut chain = CERT_TRUST_STATUS::default();
+    if partial {
+        chain.dwErrorStatus |= CERT_TRUST_IS_PARTIAL_CHAIN;
+    } else if cyclic {
+        chain.dwErrorStatus |= CERT_TRUST_IS_CYCLIC;
+    } else if let Some(root) = certificates.last()
+        && root.self_signed()?
+        && !trusted_roots.contains(&hex::encode(root.sha256_fingerprint()))
+    {
+        let root_status = elements.last_mut().unwrap();
+        root_status.dwErrorStatus |= CERT_TRUST_IS_UNTRUSTED_ROOT;
+    }
+    for status in &elements {
+        chain.dwErrorStatus |= status.dwErrorStatus;
+        chain.dwInfoStatus |= status.dwInfoStatus;
+    }
+    Ok((elements, chain))
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Builds a chain for a live certificate context.
 ///
@@ -2192,36 +2295,65 @@ pub unsafe fn CertGetCertificateChain(
 
         let mut state = STATE.lock();
         let leaf = state.context(certificate)?.certificate.clone();
-        let candidates = chain_candidates(&mut state, additional_store)?;
+        let additional = chain_candidates(&mut state, additional_store)?;
+        let roots = system_chain_candidates(&mut state, "ROOT")?;
+        let trusted_roots = roots
+            .iter()
+            .map(|certificate| hex::encode(certificate.sha256_fingerprint()))
+            .collect::<HashSet<_>>();
+        let mut candidates = BTreeMap::new();
+        insert_chain_candidates(&mut candidates, additional);
+        insert_chain_candidates(&mut candidates, system_chain_candidates(&mut state, "CA")?);
+        insert_chain_candidates(&mut candidates, roots);
+
         let mut certificates = vec![leaf.clone()];
         let mut seen = HashSet::from([hex::encode(leaf.sha256_fingerprint())]);
+        let mut invalid_signatures = HashSet::new();
         let mut current = leaf;
+        let mut partial = false;
+        let mut cyclic = false;
         while !current.self_signed()? {
             let mut issuers = BTreeMap::new();
-            for candidate in &candidates {
-                if candidate.subject_raw()? == current.issuer_raw()?
-                    && current.verify_with(candidate)?
-                {
-                    issuers.insert(
-                        hex::encode(candidate.sha256_fingerprint()),
-                        candidate.clone(),
-                    );
+            let mut name_matches = BTreeMap::new();
+            for candidate in candidates.values() {
+                if candidate.subject_raw()? == current.issuer_raw()? {
+                    let hash = hex::encode(candidate.sha256_fingerprint());
+                    name_matches.insert(hash.clone(), candidate.clone());
+                    if current.verify_with(candidate)? {
+                        issuers.insert(hash, candidate.clone());
+                    }
                 }
             }
-            require(
-                issuers.len() == 1,
-                CRYPT_E_NO_MATCH,
-                "Cannot build an unambiguous complete offline issuer chain",
-            )?;
-            let (hash, issuer) = issuers.pop_first().unwrap();
-            require(
-                seen.insert(hash),
-                ERROR_INVALID_DATA,
-                "Cycle in certificate issuer chain",
-            )?;
+            let signature_valid = !issuers.is_empty();
+            if !signature_valid {
+                issuers = name_matches;
+            }
+            let Some((hash, issuer)) = issuers
+                .iter()
+                .find(|(hash, _)| trusted_roots.contains(*hash))
+                .map(|(hash, issuer)| (hash.clone(), issuer.clone()))
+                .or_else(|| issuers.pop_first())
+            else {
+                partial = true;
+                break;
+            };
+            if !signature_valid {
+                invalid_signatures.insert(certificates.len() - 1);
+            }
+            if !seen.insert(hash) {
+                cyclic = true;
+                break;
+            }
             current = issuer.clone();
             certificates.push(issuer);
         }
+        let (element_statuses, chain_status) = chain_element_statuses(
+            &certificates,
+            &trusted_roots,
+            &invalid_signatures,
+            partial,
+            cyclic,
+        )?;
 
         state.context_mut(certificate)?.references += 1;
         let mut context_pointers = vec![certificate];
@@ -2233,9 +2365,11 @@ pub unsafe fn CertGetCertificateChain(
 
         let mut elements = context_pointers
             .iter()
-            .map(|context| CERT_CHAIN_ELEMENT {
+            .zip(element_statuses)
+            .map(|(context, status)| CERT_CHAIN_ELEMENT {
                 cbSize: std::mem::size_of::<CERT_CHAIN_ELEMENT>() as DWORD,
                 pCertContext: *context,
+                TrustStatus: status,
                 ..CERT_CHAIN_ELEMENT::default()
             })
             .collect::<Vec<_>>()
@@ -2247,6 +2381,7 @@ pub unsafe fn CertGetCertificateChain(
             .into_boxed_slice();
         let mut simple = Box::new(CERT_SIMPLE_CHAIN {
             cbSize: std::mem::size_of::<CERT_SIMPLE_CHAIN>() as DWORD,
+            TrustStatus: chain_status,
             cElement: dword(element_pointers.len())?,
             rgpElement: element_pointers.as_mut_ptr(),
             ..CERT_SIMPLE_CHAIN::default()
@@ -2254,6 +2389,7 @@ pub unsafe fn CertGetCertificateChain(
         let mut chain_pointers = vec![simple.as_mut() as *mut CERT_SIMPLE_CHAIN].into_boxed_slice();
         let public = CERT_CHAIN_CONTEXT {
             cbSize: std::mem::size_of::<CERT_CHAIN_CONTEXT>() as DWORD,
+            TrustStatus: chain_status,
             cChain: 1,
             rgpChain: chain_pointers.as_mut_ptr(),
             ..CERT_CHAIN_CONTEXT::default()
@@ -2323,9 +2459,50 @@ pub unsafe fn CertVerifyCertificateChainPolicy(
             ERROR_NOT_SUPPORTED,
             "Certificate-chain policy options are unsupported",
         )?;
-        status.dwError = unsafe { (*chain).TrustStatus.dwErrorStatus };
-        status.lChainIndex = -1;
-        status.lElementIndex = -1;
+        let chain = unsafe { &*chain };
+        let simple = unsafe { &**chain.rgpChain };
+        let elements =
+            unsafe { std::slice::from_raw_parts(simple.rgpElement, simple.cElement as usize) };
+        let find_element = |flag| {
+            elements
+                .iter()
+                .position(|element| unsafe { (**element).TrustStatus.dwErrorStatus & flag != 0 })
+        };
+
+        let errors = chain.TrustStatus.dwErrorStatus;
+        let (error, element) = if errors & CERT_TRUST_IS_UNTRUSTED_ROOT != 0 {
+            (
+                CERT_E_UNTRUSTEDROOT,
+                find_element(CERT_TRUST_IS_UNTRUSTED_ROOT).map(|index| index as i32),
+            )
+        } else if errors & (CERT_TRUST_IS_PARTIAL_CHAIN | CERT_TRUST_IS_CYCLIC) != 0 {
+            (CERT_E_CHAINING, None)
+        } else if errors & CERT_TRUST_IS_NOT_TIME_VALID != 0 {
+            (
+                CERT_E_EXPIRED,
+                find_element(CERT_TRUST_IS_NOT_TIME_VALID).map(|index| index as i32),
+            )
+        } else if errors & CERT_TRUST_IS_NOT_SIGNATURE_VALID != 0 {
+            (
+                TRUST_E_CERT_SIGNATURE,
+                find_element(CERT_TRUST_IS_NOT_SIGNATURE_VALID).map(|index| index as i32),
+            )
+        } else if errors & CERT_TRUST_IS_NOT_VALID_FOR_USAGE != 0 {
+            (
+                CERT_E_WRONG_USAGE,
+                find_element(CERT_TRUST_IS_NOT_VALID_FOR_USAGE).map(|index| index as i32),
+            )
+        } else if errors & CERT_TRUST_INVALID_BASIC_CONSTRAINTS != 0 {
+            (
+                TRUST_E_BASIC_CONSTRAINTS,
+                find_element(CERT_TRUST_INVALID_BASIC_CONSTRAINTS).map(|index| index as i32),
+            )
+        } else {
+            (ERROR_SUCCESS, None)
+        };
+        status.dwError = error;
+        status.lChainIndex = if error == ERROR_SUCCESS { -1 } else { 0 };
+        status.lElementIndex = element.unwrap_or(-1);
         Ok(TRUE)
     })
 }

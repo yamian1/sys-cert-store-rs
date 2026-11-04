@@ -95,6 +95,22 @@ CryptoAPI behavior, handles, and last-error values. The Linux-specific
 `SysCert*` extensions return `ERROR_CALL_NOT_IMPLEMENTED` on Windows.
 `SysCertGetLastErrorMessage` is one of those Linux-specific extensions.
 
+On Linux, the supported default offline chain mode follows CryptoAPI's
+build-versus-validation contract. `CertGetCertificateChain` can return `TRUE`
+for an expired, untrusted, incomplete, or otherwise invalid chain and records
+the failures in chain and element trust status.
+`CertVerifyCertificateChainPolicy` then returns `TRUE` when policy evaluation
+completes and reports certificate validity through
+`CERT_CHAIN_POLICY_STATUS.dwError`.
+
+The Linux chain builder uses certificates from the caller's additional store
+and the effective current-user `CA` and `ROOT` stores. Only membership in the
+effective `ROOT` store establishes trust. It validates current-time validity,
+signatures, issuer CA and key-usage constraints, and path-length constraints.
+Network retrieval, revocation checking, alternate-chain selection, custom
+verification times, and non-base policies remain outside the supported
+offline subset and return an explicit unsupported error.
+
 ### Migrating from 0.1.x
 
 Version 0.2.0 is a source-breaking safety correction. Raw function names,
