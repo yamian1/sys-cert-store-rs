@@ -967,7 +967,10 @@ fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), Ap
 }
 
 #[allow(clippy::vec_box)]
-fn export_contexts(handle: HCERTSTORE) -> Result<Vec<Box<Context>>, ApiError> {
+fn export_contexts(
+    handle: HCERTSTORE,
+    include_private_keys: bool,
+) -> Result<Vec<Box<Context>>, ApiError> {
     let mut state = STATE.lock();
     let view_id = store_key(handle);
     let mut source_ids = vec![view_id];
@@ -986,7 +989,9 @@ fn export_contexts(handle: HCERTSTORE) -> Result<Vec<Box<Context>>, ApiError> {
         };
         for row in rows {
             let mut context = load_context(store, row)?;
-            load_private_key(&mut context)?;
+            if include_private_keys {
+                load_private_key(&mut context)?;
+            }
             contexts.push(context);
         }
     }
@@ -1008,7 +1013,10 @@ fn encode_pfx(handle: HCERTSTORE, secret: &str, flags: DWORD) -> Result<Vec<u8>,
         ERROR_NOT_SUPPORTED,
         "PKCS#12 export flags are unsupported",
     )?;
-    let contexts = export_contexts(handle)?;
+    let include_private_keys = flags
+        & (REPORT_NO_PRIVATE_KEY | REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY | EXPORT_PRIVATE_KEYS)
+        != 0;
+    let contexts = export_contexts(handle, include_private_keys)?;
     let key_indices = contexts
         .iter()
         .enumerate()

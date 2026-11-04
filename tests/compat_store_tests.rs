@@ -572,7 +572,7 @@ fn pfx_import_and_private_material() {
     let key_path = material_path(&leaf_context, TRUE);
     assert!(cert_path.is_file() && key_path.is_file());
     assert_eq!(fs::metadata(&key_path).unwrap().mode() & 0o777, 0o600);
-    let recovered = PKey::private_key_from_pem(&fs::read(key_path).unwrap()).unwrap();
+    let recovered = PKey::private_key_from_pem(&fs::read(&key_path).unwrap()).unwrap();
     assert!(recovered.public_eq(&leaf_key));
 
     // SAFETY: the context is live and null output requests the required size.
@@ -684,6 +684,54 @@ fn pfx_import_and_private_material() {
     let exported_material = exported_pfx.parse2("password").unwrap();
     assert!(exported_material.pkey.unwrap().public_eq(&leaf_key));
     assert_eq!(exported_material.ca.unwrap().len(), 1);
+
+    fs::write(&key_path, b"corrupted private key").unwrap();
+    let mut certificate_only = CRYPT_DATA_BLOB::default();
+    // SAFETY: the store, output blob, and terminated password are live; null
+    // blob data requests the required size.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut certificate_only,
+            password.as_ptr(),
+            ptr::null_mut(),
+            0,
+        )
+    });
+    let mut certificate_only_bytes = vec![0u8; certificate_only.cbData as usize];
+    certificate_only.pbData = certificate_only_bytes.as_mut_ptr();
+    // SAFETY: the blob describes the writable certificate-only output buffer.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut certificate_only,
+            password.as_ptr(),
+            ptr::null_mut(),
+            0,
+        )
+    });
+    let certificate_only_pfx = Pkcs12::from_der(&certificate_only_bytes)
+        .unwrap()
+        .parse2("password")
+        .unwrap();
+    assert!(certificate_only_pfx.pkey.is_none());
+    assert_eq!(certificate_only_pfx.ca.unwrap().len(), 2);
+
+    let mut reported = CRYPT_DATA_BLOB::default();
+    // SAFETY: the store, output blob, and terminated password are live.
+    assert_eq!(
+        unsafe {
+            PFXExportCertStoreEx(
+                store.0,
+                &mut reported,
+                password.as_ptr(),
+                ptr::null_mut(),
+                REPORT_NOT_ABLE_TO_EXPORT_PRIVATE_KEY,
+            )
+        },
+        FALSE
+    );
+    assert_eq!(last_error(), ERROR_INVALID_DATA);
 
     let mut pkcs7 = CRYPT_DATA_BLOB::default();
     // SAFETY: the store and writable blob are live; null blob data requests
