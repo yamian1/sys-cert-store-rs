@@ -615,6 +615,45 @@ fn source_copy(state: &mut State, pointer: *const CERT_CONTEXT) -> Result<Box<Co
     Ok(result)
 }
 
+fn rollback_material_transaction(
+    store: &Store,
+    pending: &mut PendingObjectDirectories,
+    error: ApiError,
+) -> ApiError {
+    let mut failures = Vec::new();
+    if let Err(rollback) = store.db.execute_batch("ROLLBACK") {
+        failures.push(format!("database rollback failed: {rollback}"));
+    }
+    if let Err(cleanup) = pending.rollback() {
+        failures.push(format!("filesystem rollback failed: {}", cleanup.message));
+    }
+    if failures.is_empty() {
+        error
+    } else {
+        ApiError::new(
+            error.code,
+            format!("{}; {}", error.message, failures.join("; ")),
+        )
+    }
+}
+
+fn commit_material_transaction(
+    store: &Store,
+    mut pending: PendingObjectDirectories,
+) -> Result<(), ApiError> {
+    match store.db.execute_batch("COMMIT") {
+        Ok(()) => {
+            pending.commit();
+            Ok(())
+        }
+        Err(error) => Err(rollback_material_transaction(
+            store,
+            &mut pending,
+            error.into(),
+        )),
+    }
+}
+
 fn add_context(
     state: &mut State,
     handle: HCERTSTORE,
@@ -717,6 +756,7 @@ fn add_context(
             properties = merged;
         }
         store.db.execute_batch("BEGIN IMMEDIATE")?;
+        let mut pending = PendingObjectDirectories::new();
         let transaction_result = (|| {
             let mut row = existing.as_ref().map(|value| value.0).unwrap_or(0);
             if !use_existing || (source.private_key.is_some() && store.objects.is_some()) {
@@ -733,7 +773,7 @@ fn add_context(
                         .as_ref()
                         .and_then(|value| value.1.private_key.clone())
                 });
-                row = insert_material(&mut store, &material)?;
+                row = insert_material(&mut store, &material, &mut pending)?;
             } else if source.private_key.is_some() && store.objects.is_none() {
                 store.memory.get_mut(&row).unwrap().key = source.private_key.clone();
             }
@@ -742,12 +782,11 @@ fn add_context(
         })();
         let row = match transaction_result {
             Ok(row) => {
-                store.db.execute_batch("COMMIT")?;
+                commit_material_transaction(&store, pending)?;
                 row
             }
             Err(error) => {
-                let _ = store.db.execute_batch("ROLLBACK");
-                return Err(error);
+                return Err(rollback_material_transaction(&store, &mut pending, error));
             }
         };
         collect_garbage(&mut store)?;
@@ -956,14 +995,13 @@ fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), Ap
         "PKCS#12 imports require a file-backed logical store",
     )?;
     store.db.execute_batch("BEGIN IMMEDIATE")?;
+    let mut pending = PendingObjectDirectories::new();
     for context in certificates {
-        if let Err(error) = insert_material(store, context) {
-            let _ = store.db.execute_batch("ROLLBACK");
-            return Err(error);
+        if let Err(error) = insert_material(store, context, &mut pending) {
+            return Err(rollback_material_transaction(store, &mut pending, error));
         }
     }
-    store.db.execute_batch("COMMIT")?;
-    Ok(())
+    commit_material_transaction(store, pending)
 }
 
 #[allow(clippy::vec_box)]

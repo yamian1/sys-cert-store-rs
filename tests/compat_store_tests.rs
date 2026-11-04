@@ -10,6 +10,7 @@ use openssl::pkey::{PKey, Private};
 use openssl::stack::Stack;
 use openssl::x509::extension::{BasicConstraints, KeyUsage};
 use openssl::x509::{X509, X509Extension, X509NameBuilder};
+use rusqlite::Connection;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{Read, Write};
@@ -770,6 +771,113 @@ fn pfx_import_and_private_material() {
         )
     });
     assert_eq!(count(&pkcs7_store), 2);
+}
+
+#[test]
+fn failed_material_insertions_remove_new_objects() {
+    let _guard = api_lock();
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("rollback.db");
+    let objects = PathBuf::from(format!("{}.objects", path.display()));
+    let store = Store::sqlite(&path, 0);
+    let database = Connection::open(&path).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER fail_certificate_insert
+             BEFORE INSERT ON certificates
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected certificate insertion failure');
+             END;",
+        )
+        .unwrap();
+
+    let standalone = certificate(&key(), 1, "Rollback", false, None, -60, None);
+    let source = Context::from_x509(&standalone);
+    let mut added = ptr::null();
+    // SAFETY: the store, source context, and output slot are live.
+    assert_eq!(
+        unsafe {
+            CertAddCertificateContextToStore(store.0, source.0, CERT_STORE_ADD_ALWAYS, &mut added)
+        },
+        FALSE
+    );
+    assert!(added.is_null());
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM certificates", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM garbage", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(fs::read_dir(&objects).unwrap().count(), 0);
+
+    database
+        .execute_batch(
+            "DROP TRIGGER fail_certificate_insert;
+             CREATE TRIGGER fail_second_certificate_insert
+             BEFORE INSERT ON certificates
+             WHEN (SELECT count(*) FROM certificates) = 1
+             BEGIN
+                 SELECT RAISE(FAIL, 'injected second certificate insertion failure');
+             END;",
+        )
+        .unwrap();
+    let issuer_key = key();
+    let issuer = certificate(&issuer_key, 2, "Rollback CA", true, None, -60, None);
+    let leaf_key = key();
+    let leaf = certificate(
+        &leaf_key,
+        3,
+        "Rollback leaf",
+        false,
+        Some((&issuer, &issuer_key)),
+        -60,
+        None,
+    );
+    let mut chain = Stack::new().unwrap();
+    chain.push(issuer).unwrap();
+    let mut builder = Pkcs12::builder();
+    builder.name("rollback");
+    builder.pkey(&leaf_key);
+    builder.cert(&leaf);
+    builder.ca(chain);
+    let pfx = builder.build2("password").unwrap().to_der().unwrap();
+    let blob = CRYPT_DATA_BLOB {
+        cbData: pfx.len() as DWORD,
+        pbData: pfx.as_ptr().cast_mut(),
+    };
+    let password = wide("password");
+    // SAFETY: the store, PFX blob, and terminated password are live.
+    assert_eq!(
+        unsafe { SysCertImportPfxToStore(store.0, &blob, password.as_ptr(), 0) },
+        FALSE
+    );
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM certificates", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        database
+            .query_row("SELECT count(*) FROM garbage", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    assert_eq!(fs::read_dir(objects).unwrap().count(), 0);
 }
 
 #[test]

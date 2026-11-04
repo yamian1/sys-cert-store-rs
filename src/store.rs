@@ -655,10 +655,58 @@ fn write_material(path: &Path, data: &[u8], public: bool) -> Result<(), ApiError
     Ok(())
 }
 
-fn create_object(store: &Store, source: &Context) -> Result<String, ApiError> {
+#[derive(Default)]
+pub struct PendingObjectDirectories {
+    directories: Vec<PathBuf>,
+}
+
+impl PendingObjectDirectories {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn rollback(&mut self) -> Result<(), ApiError> {
+        let directories = std::mem::take(&mut self.directories);
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        for directory in directories.into_iter().rev() {
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(ApiError::from(error));
+                    }
+                    failed.push(directory);
+                }
+            }
+        }
+        self.directories = failed;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub fn commit(mut self) {
+        self.directories.clear();
+    }
+}
+
+impl Drop for PendingObjectDirectories {
+    fn drop(&mut self) {
+        for directory in self.directories.drain(..).rev() {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
+}
+
+fn create_object(
+    store: &Store,
+    source: &Context,
+    pending: &mut PendingObjectDirectories,
+) -> Result<String, ApiError> {
     let id = random_object_id();
     let directory = object_directory(store, &id)?;
     fs::create_dir(&directory)?;
+    pending.directories.push(directory.clone());
     fs::set_permissions(
         &directory,
         fs::Permissions::from_mode(if store.public_material { 0o755 } else { 0o700 }),
@@ -766,9 +814,13 @@ pub fn row_exists(store: &Store, row: i64) -> Result<bool, ApiError> {
         .is_some())
 }
 
-pub fn insert_material(store: &mut Store, source: &Context) -> Result<i64, ApiError> {
+pub fn insert_material(
+    store: &mut Store,
+    source: &Context,
+    pending: &mut PendingObjectDirectories,
+) -> Result<i64, ApiError> {
     let object = if store.objects.is_some() {
-        create_object(store, source)?
+        create_object(store, source, pending)?
     } else {
         String::new()
     };
@@ -835,4 +887,51 @@ pub fn write_properties(store: &Store, row: i64, properties: &Properties) -> Res
 
 pub fn resync_native(store: &mut Store) -> Result<(), ApiError> {
     load_native_store(store)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_directories_remove_partially_created_objects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("partial.db");
+        let mut store = empty_store().unwrap();
+        persistent_store(&mut store, &path, 0).unwrap();
+        let certificate = Certificate::from_pem(include_bytes!(
+            "../third_party/openssl/test/certs/root-cert.pem"
+        ))
+        .unwrap();
+        let key = PrivateKey::from_pem(include_bytes!(
+            "../third_party/openssl/test/certs/ee-key.pem"
+        ))
+        .unwrap();
+        let mut context = Context::new(certificate.to_der()).unwrap();
+        context.private_key = Some(Arc::new(key));
+        let objects = store.objects.clone().unwrap();
+
+        {
+            let mut pending = PendingObjectDirectories::new();
+            let error = create_object(&store, &context, &mut pending).unwrap_err();
+            assert_eq!(error.code, ERROR_INVALID_DATA);
+            assert_eq!(fs::read_dir(&objects).unwrap().count(), 1);
+        }
+
+        assert_eq!(fs::read_dir(objects).unwrap().count(), 0);
+
+        let matching_key = PrivateKey::from_pem(include_bytes!(
+            "../third_party/openssl/test/certs/root-key.pem"
+        ))
+        .unwrap();
+        context.private_key = Some(Arc::new(matching_key));
+        let objects = store.objects.clone().unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut pending = PendingObjectDirectories::new();
+            create_object(&store, &context, &mut pending).unwrap();
+            panic!("injected unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(fs::read_dir(objects).unwrap().count(), 0);
+    }
 }
