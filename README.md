@@ -37,37 +37,17 @@ Clone the repository beside your application and add it as a path dependency:
 sys-cert-store = { path = "../sys-cert-store-rs" }
 ```
 
-The API uses familiar CryptoAPI names and data structures. The following
-example opens the current scope's `ROOT` store and counts its certificates:
+The safe API owns stores, certificate contexts, and chains and releases them
+exactly once. The following example opens the current scope's `ROOT` store and
+counts its certificates:
 
 ```rust
-use std::ptr;
-use sys_cert_store::api_types::{CRYPT_E_NOT_FOUND, FALSE, WCHAR};
-use sys_cert_store::{
-    CertCloseStore, CertEnumCertificatesInStore, CertOpenSystemStoreW,
-    GetLastError,
-};
+use sys_cert_store::safe::CertificateStore;
 
-fn main() {
-    let mut store_name: Vec<WCHAR> = "ROOT".encode_utf16().collect();
-    store_name.push(0);
-
-    let store = CertOpenSystemStoreW(0, store_name.as_ptr());
-    assert!(!store.is_null(), "open failed: 0x{:x}", GetLastError());
-
-    let mut count = 0;
-    let mut certificate = ptr::null();
-    loop {
-        certificate = CertEnumCertificatesInStore(store, certificate);
-        if certificate.is_null() {
-            break;
-        }
-        count += 1;
-    }
-
-    assert_eq!(GetLastError(), CRYPT_E_NOT_FOUND);
-    assert_ne!(CertCloseStore(store, 0), FALSE);
-    println!("{count} certificates");
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = CertificateStore::open_system("ROOT")?;
+    println!("{} certificates", store.certificates()?.len());
+    Ok(())
 }
 ```
 
@@ -77,7 +57,15 @@ Run the complete example with:
 cargo run --example list_certificates
 ```
 
-The crate exposes standard CryptoAPI operations for:
+The `safe` module initially covers:
+
+- Opening system certificate stores
+- Enumerating certificates into independently owned context handles
+- Creating and duplicating certificate contexts
+- Building certificate chains
+- Automatically closing stores and releasing contexts and chains
+
+The crate also exposes raw CryptoAPI-compatible operations for:
 
 - Opening memory, system, and PKCS#7 stores
 - Creating, duplicating, enumerating, finding, and freeing certificate contexts
@@ -89,14 +77,39 @@ The crate exposes standard CryptoAPI operations for:
 - Locating persisted certificate files on Linux
 - Populating the .NET CRL cache on Linux
 
-The API is intentionally low level and uses handles, pointers, explicit
-lifetimes, two-call output-buffer patterns, and `GetLastError`-style error
-reporting.
+## Raw compatibility API
+
+The Win32-shaped functions at the crate root are intentionally low level and
+use handles, pointers, explicit lifetimes, two-call output-buffer patterns,
+and `GetLastError`-style error reporting. Functions whose correctness depends
+on caller-provided pointer, lifetime, or ownership guarantees are `unsafe fn`.
+Each such function documents its requirements in a `# Safety` section.
+
+Prefer `sys_cert_store::safe` for ordinary application code. Use the raw
+surface only when implementing compatibility behavior that the safe module
+does not yet cover, and keep each unsafe block narrow enough to state why its
+pointers and owned handles satisfy the documented contract.
 
 On Windows, the standard `Cert*`, `Crypt*`, and PFX calls preserve native
 CryptoAPI behavior, handles, and last-error values. The Linux-specific
 `SysCert*` extensions return `ERROR_CALL_NOT_IMPLEMENTED` on Windows.
 `SysCertGetLastErrorMessage` is one of those Linux-specific extensions.
+
+### Migrating from 0.1.x
+
+Version 0.2.0 is a source-breaking safety correction. Raw function names,
+arguments, return values, and platform behavior are unchanged, but calls that
+depend on caller-enforced memory or ownership invariants now require an
+explicit unsafe block.
+
+- Replace manual store close guards with `safe::CertificateStore`.
+- Replace create/duplicate/free context pairs with
+  `safe::CertificateContextHandle`.
+- Replace build/free chain pairs with `safe::CertificateChainHandle`.
+- For remaining raw calls, satisfy and document the function's `# Safety`
+  contract rather than broadly marking an entire operation unsafe.
+- `cert::Context` is now internal and cannot be named or mutated by external
+  callers.
 
 ## Use `certutil` on Linux
 

@@ -10,23 +10,15 @@ mod app {
     use std::ptr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
-    use sys_cert_store::api_types::*;
-    use sys_cert_store::{
-        CertCloseStore, CertEnumCertificatesInStore, CertFreeCertificateChain,
-        CertGetCertificateChain, CertOpenStore, GetLastError, SysCertGetLastErrorMessage,
-        SysCertPopulateDotNetCrlCache,
+    use sys_cert_store::api_types::{
+        CERT_STORE_OPEN_EXISTING_FLAG, CERT_STORE_READONLY_FLAG, CERT_SYSTEM_STORE_LOCAL_MACHINE,
+        FALSE,
     };
+    use sys_cert_store::safe::{CertificateChainHandle, CertificateStore};
+    use sys_cert_store::{GetLastError, SysCertGetLastErrorMessage, SysCertPopulateDotNetCrlCache};
 
     const DEFAULT_CONFIG_PATH: &str = "/etc/sys-cert-store/linux-crl-cache-service.conf";
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-    struct Store(HCERTSTORE);
-
-    impl Drop for Store {
-        fn drop(&mut self) {
-            CertCloseStore(self.0, 0);
-        }
-    }
 
     struct Options {
         config: PathBuf,
@@ -45,76 +37,42 @@ mod app {
         format!("{operation} failed (0x{:08x}): {detail}", GetLastError())
     }
 
-    fn wide(value: &str) -> Vec<WCHAR> {
-        value.encode_utf16().chain([0]).collect()
-    }
-
-    fn open_machine_my() -> Result<Store, String> {
-        let name = wide("MY");
-        let store = CertOpenStore(
-            PROVIDER_SYSTEM_W as LPCSTR,
-            0,
-            0,
+    fn open_machine_my() -> Result<CertificateStore, String> {
+        CertificateStore::open_system_with_flags(
+            "MY",
             CERT_SYSTEM_STORE_LOCAL_MACHINE
                 | CERT_STORE_OPEN_EXISTING_FLAG
                 | CERT_STORE_READONLY_FLAG,
-            name.as_ptr().cast(),
-        );
-        if store.is_null() {
-            Err(last_error("opening LocalMachine MY"))
-        } else {
-            Ok(Store(store))
-        }
+        )
+        .map_err(|_| last_error("opening LocalMachine MY"))
     }
 
-    fn build_chains(store: HCERTSTORE) -> Result<(usize, usize), String> {
-        let parameters = CERT_CHAIN_PARA {
-            cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as DWORD,
-            ..CERT_CHAIN_PARA::default()
-        };
-        let mut certificate = ptr::null();
-        let mut certificates = 0;
+    fn build_chains(store: &CertificateStore) -> Result<(usize, usize), String> {
+        let certificates = store
+            .certificates()
+            .map_err(|_| last_error("enumerating LocalMachine MY"))?;
         let mut failures = 0;
         let mut first_failure = None;
 
-        loop {
-            certificate = CertEnumCertificatesInStore(store, certificate);
-            if certificate.is_null() {
-                if GetLastError() == CRYPT_E_NOT_FOUND {
-                    break;
-                }
-                return Err(last_error("enumerating LocalMachine MY"));
-            }
-            certificates += 1;
-            let mut chain = ptr::null();
-            if CertGetCertificateChain(
-                ptr::null_mut(),
-                certificate,
-                ptr::null(),
-                store,
-                &parameters,
-                0,
-                ptr::null_mut(),
-                &mut chain,
-            ) == FALSE
-            {
+        for certificate in &certificates {
+            if CertificateChainHandle::build(certificate, Some(store)).is_err() {
                 failures += 1;
                 first_failure.get_or_insert_with(|| last_error("building a certificate chain"));
-                continue;
             }
-            CertFreeCertificateChain(chain);
         }
 
         if let Some(first_failure) = first_failure {
             eprintln!("{failures} certificate chain(s) failed; first failure: {first_failure}");
         }
-        Ok((certificates, failures))
+        Ok((certificates.len(), failures))
     }
 
     fn run_cycle() -> Result<(), String> {
         let store = open_machine_my()?;
-        let (certificates, chain_failures) = build_chains(store.0)?;
-        if SysCertPopulateDotNetCrlCache(ptr::null()) == FALSE {
+        let (certificates, chain_failures) = build_chains(&store)?;
+        // SAFETY: null selects the current account and requires no pointed-to
+        // storage.
+        if unsafe { SysCertPopulateDotNetCrlCache(ptr::null()) } == FALSE {
             return Err(last_error("populating the .NET CRL caches"));
         }
         eprintln!(

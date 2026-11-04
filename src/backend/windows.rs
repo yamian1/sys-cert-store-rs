@@ -1,4 +1,4 @@
-#![allow(clippy::not_unsafe_ptr_arg_deref, non_snake_case)]
+#![allow(non_snake_case)]
 
 use crate::api_types::*;
 use core::ffi::{c_char, c_void};
@@ -53,7 +53,13 @@ pub fn SysCertGetLastErrorMessage() -> *const c_char {
     not_implemented(ptr::null())
 }
 
-pub fn CryptStringToBinaryA(
+/// Converts a readable encoded string into binary data.
+///
+/// # Safety
+///
+/// `string` must identify the requested readable string, and non-null output
+/// pointers must be writable for the capacities described by their arguments.
+pub unsafe fn CryptStringToBinaryA(
     string: LPCSTR,
     string_length: DWORD,
     flags: DWORD,
@@ -75,7 +81,13 @@ pub fn CryptStringToBinaryA(
     }
 }
 
-pub fn CryptBinaryToStringA(
+/// Converts readable binary data into a string.
+///
+/// # Safety
+///
+/// `binary` must be readable for `binary_size` bytes. `string_size` must be
+/// writable, and a non-null `string` must cover the supplied capacity.
+pub unsafe fn CryptBinaryToStringA(
     binary: *const BYTE,
     binary_size: DWORD,
     flags: DWORD,
@@ -85,7 +97,13 @@ pub fn CryptBinaryToStringA(
     unsafe { win::CryptBinaryToStringA(binary, binary_size, flags, string.cast(), string_size) }
 }
 
-pub fn CertNameToStrA(
+/// Formats an encoded certificate name.
+///
+/// # Safety
+///
+/// `name` must point to a live name blob whose data is readable. A non-null
+/// `output` must be writable for `output_size` bytes.
+pub unsafe fn CertNameToStrA(
     encoding: DWORD,
     name: *const CERT_NAME_BLOB,
     string_type: DWORD,
@@ -103,7 +121,13 @@ pub fn CertNameToStrA(
     }
 }
 
-pub fn CertGetNameStringA(
+/// Reads a formatted name from a live certificate context.
+///
+/// # Safety
+///
+/// `certificate` and any name-type-specific `type_parameter` must be valid for
+/// the call. A non-null `output` must be writable for `output_size` bytes.
+pub unsafe fn CertGetNameStringA(
     certificate: *const CERT_CONTEXT,
     name_type: DWORD,
     flags: DWORD,
@@ -123,15 +147,33 @@ pub fn CertGetNameStringA(
     }
 }
 
-pub fn SysCertConfigureSystemStores(_: *const SYS_CERT_STORE_CONFIGURATION) -> BOOL {
+/// Configures Linux system-store locations.
+///
+/// # Safety
+///
+/// A non-null configuration must point to a live structure and to valid
+/// terminated strings for every populated field.
+pub unsafe fn SysCertConfigureSystemStores(_: *const SYS_CERT_STORE_CONFIGURATION) -> BOOL {
     not_implemented(FALSE)
 }
 
-pub fn SysCertGetCertificateStoreLocation(_: *const CERT_CONTEXT, _: *mut DWORD) -> BOOL {
+/// Gets the configured location of a certificate context.
+///
+/// # Safety
+///
+/// The context must be live and produced by this API. The output pointer must
+/// be writable when non-null.
+pub unsafe fn SysCertGetCertificateStoreLocation(_: *const CERT_CONTEXT, _: *mut DWORD) -> BOOL {
     not_implemented(FALSE)
 }
 
-pub fn CertOpenStore(
+/// Opens a certificate store through a provider-specific parameter.
+///
+/// # Safety
+///
+/// `provider` and `parameter` must satisfy the type, readability, termination,
+/// and lifetime requirements of the selected provider.
+pub unsafe fn CertOpenStore(
     provider: LPCSTR,
     encoding: DWORD,
     legacy: HCRYPTPROV_LEGACY,
@@ -141,23 +183,45 @@ pub fn CertOpenStore(
     unsafe { win::CertOpenStore(provider.cast(), encoding, legacy, flags, parameter) }
 }
 
-pub fn CertOpenSystemStoreW(legacy: HCRYPTPROV_LEGACY, name: LPCWSTR) -> HCERTSTORE {
+/// Opens a UTF-16 named system store.
+///
+/// # Safety
+///
+/// `name` must point to a readable, terminated UTF-16 string.
+pub unsafe fn CertOpenSystemStoreW(legacy: HCRYPTPROV_LEGACY, name: LPCWSTR) -> HCERTSTORE {
     unsafe { win::CertOpenSystemStoreW(legacy, name) }
 }
 
-pub fn CertOpenSystemStoreA(legacy: HCRYPTPROV_LEGACY, name: LPCSTR) -> HCERTSTORE {
+/// Opens an ANSI named system store.
+///
+/// # Safety
+///
+/// `name` must point to a readable, terminated string.
+pub unsafe fn CertOpenSystemStoreA(legacy: HCRYPTPROV_LEGACY, name: LPCSTR) -> HCERTSTORE {
     unsafe { win::CertOpenSystemStoreA(legacy, name.cast()) }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn CertDuplicateStore(handle: HCERTSTORE) -> HCERTSTORE {
+    // Opaque handles are validated by CryptoAPI; no caller-provided memory is
+    // read through this value.
     unsafe { win::CertDuplicateStore(handle) }
 }
 
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn CertCloseStore(handle: HCERTSTORE, flags: DWORD) -> BOOL {
+    // Opaque handles are validated by CryptoAPI; invalid values are reported
+    // as handle errors rather than dereferenced as caller-provided memory.
     unsafe { win::CertCloseStore(handle, flags) }
 }
 
-pub fn CertCreateCertificateContext(
+/// Creates an owned certificate-context reference from encoded bytes.
+///
+/// # Safety
+///
+/// `encoded` must be readable for `size` bytes, unless the documented
+/// zero-length null convention applies.
+pub unsafe fn CertCreateCertificateContext(
     encoding: DWORD,
     encoded: *const BYTE,
     size: DWORD,
@@ -165,22 +229,45 @@ pub fn CertCreateCertificateContext(
     unsafe { win::CertCreateCertificateContext(encoding, encoded, size).cast() }
 }
 
-pub fn CertDuplicateCertificateContext(context: *const CERT_CONTEXT) -> *const CERT_CONTEXT {
+/// Duplicates one live certificate-context reference.
+///
+/// # Safety
+///
+/// `context` must be null or a live context accepted by the current backend.
+pub unsafe fn CertDuplicateCertificateContext(context: *const CERT_CONTEXT) -> *const CERT_CONTEXT {
     unsafe { win::CertDuplicateCertificateContext(context.cast()).cast() }
 }
 
-pub fn CertFreeCertificateContext(context: *const CERT_CONTEXT) -> BOOL {
+/// Releases one owned certificate-context reference.
+///
+/// # Safety
+///
+/// `context` must be null or one live owned reference returned by the current
+/// backend, and that reference must not be used after this call.
+pub unsafe fn CertFreeCertificateContext(context: *const CERT_CONTEXT) -> BOOL {
     unsafe { win::CertFreeCertificateContext(context.cast()) }
 }
 
-pub fn CertEnumCertificatesInStore(
+/// Advances certificate enumeration in a store.
+///
+/// # Safety
+///
+/// `previous` must be null or the live context returned by the preceding
+/// enumeration call for `handle`. The call consumes that previous reference.
+pub unsafe fn CertEnumCertificatesInStore(
     handle: HCERTSTORE,
     previous: *const CERT_CONTEXT,
 ) -> *const CERT_CONTEXT {
     unsafe { win::CertEnumCertificatesInStore(handle, previous.cast()).cast() }
 }
 
-pub fn CertFindCertificateInStore(
+/// Finds a certificate using type-specific search data.
+///
+/// # Safety
+///
+/// `parameter` must have the type and lifetime required by `kind`. `previous`
+/// must be null or a live context from the same store and is consumed.
+pub unsafe fn CertFindCertificateInStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     flags: DWORD,
@@ -194,7 +281,13 @@ pub fn CertFindCertificateInStore(
     }
 }
 
-pub fn CertGetSubjectCertificateFromStore(
+/// Finds a subject certificate from certificate information.
+///
+/// # Safety
+///
+/// `information` must point to a live `CERT_INFO` whose nested pointers remain
+/// readable for the call.
+pub unsafe fn CertGetSubjectCertificateFromStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     information: *mut CERT_INFO,
@@ -202,7 +295,13 @@ pub fn CertGetSubjectCertificateFromStore(
     unsafe { win::CertGetSubjectCertificateFromStore(handle, encoding, information.cast()).cast() }
 }
 
-pub fn CertGetIssuerCertificateFromStore(
+/// Finds an issuer for a live subject context.
+///
+/// # Safety
+///
+/// `subject` must be live. `previous` must be null or a live prior result and
+/// is consumed. `flags` must be writable.
+pub unsafe fn CertGetIssuerCertificateFromStore(
     handle: HCERTSTORE,
     subject: *const CERT_CONTEXT,
     previous: *const CERT_CONTEXT,
@@ -214,7 +313,13 @@ pub fn CertGetIssuerCertificateFromStore(
     }
 }
 
-pub fn CertAddCertificateContextToStore(
+/// Adds a live certificate context to a store.
+///
+/// # Safety
+///
+/// `context` must be live. A non-null `result` must be writable and its
+/// returned reference must later be released exactly once.
+pub unsafe fn CertAddCertificateContextToStore(
     handle: HCERTSTORE,
     context: *const CERT_CONTEXT,
     disposition: DWORD,
@@ -225,7 +330,13 @@ pub fn CertAddCertificateContextToStore(
     }
 }
 
-pub fn CertAddEncodedCertificateToStore(
+/// Adds encoded certificate bytes to a store.
+///
+/// # Safety
+///
+/// `encoded` must be readable for `size` bytes. A non-null `result` must be
+/// writable and its returned reference must later be released exactly once.
+pub unsafe fn CertAddEncodedCertificateToStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     encoded: *const BYTE,
@@ -245,11 +356,23 @@ pub fn CertAddEncodedCertificateToStore(
     }
 }
 
-pub fn CertDeleteCertificateFromStore(context: *const CERT_CONTEXT) -> BOOL {
+/// Deletes a certificate and consumes its context reference.
+///
+/// # Safety
+///
+/// `context` must be one live owned store context and must not be used after
+/// the call, whether deletion succeeds or fails according to backend rules.
+pub unsafe fn CertDeleteCertificateFromStore(context: *const CERT_CONTEXT) -> BOOL {
     unsafe { win::CertDeleteCertificateFromStore(context.cast()) }
 }
 
-pub fn CertGetCertificateContextProperty(
+/// Reads a property from a live certificate context.
+///
+/// # Safety
+///
+/// `context` must be live, `size` must be writable, and a non-null `data`
+/// buffer must cover the capacity supplied through `size`.
+pub unsafe fn CertGetCertificateContextProperty(
     context: *const CERT_CONTEXT,
     property: DWORD,
     data: *mut c_void,
@@ -258,7 +381,13 @@ pub fn CertGetCertificateContextProperty(
     unsafe { win::CertGetCertificateContextProperty(context.cast(), property, data, size) }
 }
 
-pub fn CertSetCertificateContextProperty(
+/// Sets a property on a live certificate context.
+///
+/// # Safety
+///
+/// `context` must be live. A non-null `data` value must have the property-
+/// specific type, readability, and lifetime required by `property`.
+pub unsafe fn CertSetCertificateContextProperty(
     context: *const CERT_CONTEXT,
     property: DWORD,
     flags: DWORD,
@@ -267,14 +396,25 @@ pub fn CertSetCertificateContextProperty(
     unsafe { win::CertSetCertificateContextProperty(context.cast(), property, flags, data) }
 }
 
-pub fn CertEnumCertificateContextProperties(
+/// Enumerates properties on a live certificate context.
+///
+/// # Safety
+///
+/// `context` must be a live context accepted by the current backend.
+pub unsafe fn CertEnumCertificateContextProperties(
     context: *const CERT_CONTEXT,
     previous: DWORD,
 ) -> DWORD {
     unsafe { win::CertEnumCertificateContextProperties(context.cast(), previous) }
 }
 
-pub fn CertGetStoreProperty(
+/// Reads a certificate-store property.
+///
+/// # Safety
+///
+/// `size` must be writable, and a non-null `data` buffer must cover the
+/// capacity supplied through `size`.
+pub unsafe fn CertGetStoreProperty(
     handle: HCERTSTORE,
     property: DWORD,
     data: *mut c_void,
@@ -283,7 +423,13 @@ pub fn CertGetStoreProperty(
     unsafe { win::CertGetStoreProperty(handle, property, data, size) }
 }
 
-pub fn CertSetStoreProperty(
+/// Sets a certificate-store property.
+///
+/// # Safety
+///
+/// A non-null `data` value must have the property-specific type, readability,
+/// and lifetime required by `property`.
+pub unsafe fn CertSetStoreProperty(
     handle: HCERTSTORE,
     property: DWORD,
     flags: DWORD,
@@ -292,7 +438,13 @@ pub fn CertSetStoreProperty(
     unsafe { win::CertSetStoreProperty(handle, property, flags, data) }
 }
 
-pub fn CertControlStore(
+/// Performs a provider-specific store control operation.
+///
+/// # Safety
+///
+/// `parameter` must have the type, readability, mutability, and lifetime
+/// required by `control`.
+pub unsafe fn CertControlStore(
     handle: HCERTSTORE,
     flags: DWORD,
     control: DWORD,
@@ -301,7 +453,13 @@ pub fn CertControlStore(
     unsafe { win::CertControlStore(handle, flags, control, parameter) }
 }
 
-pub fn CertSaveStore(
+/// Saves a certificate store to a caller-selected destination.
+///
+/// # Safety
+///
+/// `parameter` must identify writable destination storage of the type and
+/// capacity required by `save_to`.
+pub unsafe fn CertSaveStore(
     handle: HCERTSTORE,
     encoding: DWORD,
     save_as: DWORD,
@@ -313,7 +471,13 @@ pub fn CertSaveStore(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn CertGetCertificateChain(
+/// Builds a chain for a live certificate context.
+///
+/// # Safety
+///
+/// All non-null input structures must be live with valid nested pointers.
+/// `chain_context` must be writable, and its returned chain must be freed once.
+pub unsafe fn CertGetCertificateChain(
     chain_engine: HCERTCHAINENGINE,
     certificate: *const CERT_CONTEXT,
     time: *const FILETIME,
@@ -337,11 +501,23 @@ pub fn CertGetCertificateChain(
     }
 }
 
-pub fn CertFreeCertificateChain(chain: *const CERT_CHAIN_CONTEXT) {
+/// Releases one certificate-chain allocation.
+///
+/// # Safety
+///
+/// `chain` must be null or the live chain returned by this backend. A non-null
+/// chain must be freed exactly once and not accessed afterward.
+pub unsafe fn CertFreeCertificateChain(chain: *const CERT_CHAIN_CONTEXT) {
     unsafe { win::CertFreeCertificateChain(chain.cast()) };
 }
 
-pub fn CertVerifyCertificateChainPolicy(
+/// Verifies policy for a live certificate chain.
+///
+/// # Safety
+///
+/// `chain` and `parameters` must point to live structures with valid nested
+/// pointers, and `status` must be writable.
+pub unsafe fn CertVerifyCertificateChainPolicy(
     policy: LPCSTR,
     chain: *const CERT_CHAIN_CONTEXT,
     parameters: *const CERT_CHAIN_POLICY_PARA,
@@ -357,7 +533,13 @@ pub fn CertVerifyCertificateChainPolicy(
     }
 }
 
-pub fn SysCertUpdateTrustAnchor(
+/// Updates native trust for a certificate.
+///
+/// # Safety
+///
+/// The certificate must be live, and a non-null options pointer must identify
+/// a live options structure with valid nested data.
+pub unsafe fn SysCertUpdateTrustAnchor(
     _: *const CERT_CONTEXT,
     _: BOOL,
     _: *const SYS_CERT_NATIVE_OPTIONS,
@@ -366,7 +548,13 @@ pub fn SysCertUpdateTrustAnchor(
     not_implemented(FALSE)
 }
 
-pub fn SysCertImportPfxToStore(
+/// Imports a readable PFX blob into a store.
+///
+/// # Safety
+///
+/// The blob and its data must be readable. A non-null password must be a
+/// readable terminated UTF-16 string.
+pub unsafe fn SysCertImportPfxToStore(
     _: HCERTSTORE,
     _: *const CRYPT_DATA_BLOB,
     _: LPCWSTR,
@@ -375,7 +563,13 @@ pub fn SysCertImportPfxToStore(
     not_implemented(FALSE)
 }
 
-pub fn PFXImportCertStore(
+/// Imports a readable PFX blob as a certificate store.
+///
+/// # Safety
+///
+/// `pfx` and its data must be readable. A non-null password must be a readable
+/// terminated UTF-16 string.
+pub unsafe fn PFXImportCertStore(
     pfx: *mut CRYPT_DATA_BLOB,
     password: LPCWSTR,
     flags: DWORD,
@@ -383,7 +577,13 @@ pub fn PFXImportCertStore(
     unsafe { win::PFXImportCertStore(pfx.cast(), password, flags) }
 }
 
-pub fn PFXExportCertStoreEx(
+/// Exports a certificate store into a PFX blob.
+///
+/// # Safety
+///
+/// `pfx` must be writable and any supplied data buffer must cover its stated
+/// capacity. Password and parameter pointers must satisfy native requirements.
+pub unsafe fn PFXExportCertStoreEx(
     handle: HCERTSTORE,
     pfx: *mut CRYPT_DATA_BLOB,
     password: LPCWSTR,
@@ -395,7 +595,13 @@ pub fn PFXExportCertStoreEx(
     }
 }
 
-pub fn SysCertGetCertificateFilePath(
+/// Gets a persisted path for a live certificate context.
+///
+/// # Safety
+///
+/// The context must be live, `size` must be writable, and a non-null path
+/// buffer must cover the capacity supplied through `size`.
+pub unsafe fn SysCertGetCertificateFilePath(
     _: *const CERT_CONTEXT,
     _: BOOL,
     _: *mut c_char,
@@ -404,11 +610,22 @@ pub fn SysCertGetCertificateFilePath(
     not_implemented(FALSE)
 }
 
-pub fn SysCertPopulateDotNetCrlCache(_: LPCSTR) -> BOOL {
+/// Populates the .NET CRL cache for an optional account name.
+///
+/// # Safety
+///
+/// A non-null account name must point to a readable terminated string.
+pub unsafe fn SysCertPopulateDotNetCrlCache(_: LPCSTR) -> BOOL {
     not_implemented(FALSE)
 }
 
-pub fn CertEnumSystemStoreLocation(
+/// Enumerates system-store locations through a callback.
+///
+/// # Safety
+///
+/// `argument` and callback state must remain valid for the synchronous call.
+/// The callback must obey its API contract for all values supplied to it.
+pub unsafe fn CertEnumSystemStoreLocation(
     flags: DWORD,
     argument: *mut c_void,
     callback: PFN_CERT_ENUM_SYSTEM_STORE_LOCATION,
@@ -416,7 +633,13 @@ pub fn CertEnumSystemStoreLocation(
     unsafe { win::CertEnumSystemStoreLocation(flags, argument, callback) }
 }
 
-pub fn CertEnumSystemStore(
+/// Enumerates system stores through a callback.
+///
+/// # Safety
+///
+/// Location data, `argument`, and callback state must remain valid for the
+/// synchronous call. The callback must obey its API contract.
+pub unsafe fn CertEnumSystemStore(
     flags: DWORD,
     location_parameter: *mut c_void,
     argument: *mut c_void,
@@ -436,14 +659,16 @@ mod tests {
     fn native_system_store_round_trip() {
         let mut name = "ROOT".encode_utf16().collect::<Vec<_>>();
         name.push(0);
-        let store = CertOpenSystemStoreW(0, name.as_ptr());
+        // SAFETY: `name` is a live, terminated UTF-16 string.
+        let store = unsafe { CertOpenSystemStoreW(0, name.as_ptr()) };
         assert!(!store.is_null());
         assert_ne!(CertCloseStore(store, 0), FALSE);
     }
 
     #[test]
     fn unsupported_extensions_report_not_implemented() {
-        assert_eq!(SysCertConfigureSystemStores(ptr::null()), FALSE);
+        // SAFETY: null selects the documented default configuration.
+        assert_eq!(unsafe { SysCertConfigureSystemStores(ptr::null()) }, FALSE);
         assert_eq!(GetLastError(), ERROR_CALL_NOT_IMPLEMENTED);
     }
 }

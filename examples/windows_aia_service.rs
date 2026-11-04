@@ -15,11 +15,10 @@ mod app {
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::time::{Duration, Instant, SystemTime};
     use sys_cert_store::api_types::*;
-    use sys_cert_store::{
-        CertAddCertificateContextToStore, CertCloseStore, CertEnumCertificatesInStore,
-        CertFreeCertificateChain, CertFreeCertificateContext, CertGetCertificateChain,
-        CertOpenStore, GetLastError,
+    use sys_cert_store::safe::{
+        CertificateChainHandle, CertificateContextHandle, CertificateStore,
     };
+    use sys_cert_store::{CertAddCertificateContextToStore, GetLastError};
     use windows_sys::Win32::Foundation::{LocalFree, NO_ERROR};
     use windows_sys::Win32::Security::Cryptography as win;
     use windows_sys::Win32::System::Services as services;
@@ -32,22 +31,6 @@ mod app {
 
     static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
     static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
-
-    struct Store(HCERTSTORE);
-
-    impl Drop for Store {
-        fn drop(&mut self) {
-            CertCloseStore(self.0, 0);
-        }
-    }
-
-    struct Chain(*const CERT_CHAIN_CONTEXT);
-
-    impl Drop for Chain {
-        fn drop(&mut self) {
-            CertFreeCertificateChain(self.0);
-        }
-    }
 
     struct LocalAllocation(*mut c_void);
 
@@ -134,24 +117,13 @@ mod app {
             .map_err(|_| "AIA URL contains invalid UTF-16".to_owned())
     }
 
-    fn open_machine_store(name: &str, read_only: bool) -> Result<Store, String> {
-        let name = wide(name);
+    fn open_machine_store(name: &str, read_only: bool) -> Result<CertificateStore, String> {
         let mut flags = CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG;
         if read_only {
             flags |= CERT_STORE_READONLY_FLAG;
         }
-        let store = CertOpenStore(
-            PROVIDER_SYSTEM_W as LPCSTR,
-            0,
-            0,
-            flags,
-            name.as_ptr().cast(),
-        );
-        if store.is_null() {
-            Err(error("opening a LocalMachine certificate store"))
-        } else {
-            Ok(Store(store))
-        }
+        CertificateStore::open_system_with_flags(name, flags)
+            .map_err(|error| format!("opening a LocalMachine certificate store failed: {error}"))
     }
 
     unsafe fn aia_urls(certificate: *const CERT_CONTEXT) -> Result<Vec<String>, String> {
@@ -248,14 +220,21 @@ mod app {
             return Err(error("downloading an AIA issuer certificate"));
         }
 
-        let certificate = object.cast::<CERT_CONTEXT>();
-        let added = CertAddCertificateContextToStore(
-            ca_store,
-            certificate,
-            CERT_STORE_ADD_USE_EXISTING,
-            ptr::null_mut(),
-        );
-        CertFreeCertificateContext(certificate);
+        // SAFETY: CryptRetrieveObjectByUrlW returned one owned certificate
+        // context reference in `object`.
+        let certificate =
+            unsafe { CertificateContextHandle::from_raw_owned(object.cast::<CERT_CONTEXT>()) }
+                .map_err(|error| format!("using a downloaded certificate failed: {error}"))?;
+        // SAFETY: the wrapper keeps the downloaded context live and the null
+        // result pointer requests no returned context reference.
+        let added = unsafe {
+            CertAddCertificateContextToStore(
+                ca_store,
+                certificate.as_ptr(),
+                CERT_STORE_ADD_USE_EXISTING,
+                ptr::null_mut(),
+            )
+        };
         if added == FALSE {
             Err(error(
                 "installing an AIA issuer certificate in LocalMachine CA",
@@ -317,43 +296,30 @@ mod app {
     fn run_cycle() -> Result<(), String> {
         let my_store = open_machine_store("MY", true)?;
         let ca_store = open_machine_store("CA", false)?;
-        let parameters = CERT_CHAIN_PARA {
-            cbSize: std::mem::size_of::<CERT_CHAIN_PARA>() as DWORD,
-            ..CERT_CHAIN_PARA::default()
-        };
-        let mut certificate = ptr::null();
-        let mut certificates = 0;
+        let contexts = my_store
+            .certificates()
+            .map_err(|error| format!("enumerating LocalMachine MY failed: {error}"))?;
+        let certificates = contexts.len();
         let mut installed = 0;
         let mut seen_urls = HashSet::new();
         let mut failures = FailureSummary::default();
 
-        loop {
-            certificate = CertEnumCertificatesInStore(my_store.0, certificate);
-            if certificate.is_null() {
-                if GetLastError() == CRYPT_E_NOT_FOUND {
-                    break;
+        for certificate in &contexts {
+            let chain = match CertificateChainHandle::build(certificate, Some(&my_store)) {
+                Ok(chain) => chain,
+                Err(error) => {
+                    failures.add(format!("building a certificate chain failed: {error}"));
+                    continue;
                 }
-                return Err(error("enumerating LocalMachine MY"));
-            }
-            certificates += 1;
-            let mut chain = ptr::null();
-            if CertGetCertificateChain(
-                ptr::null_mut(),
-                certificate,
-                ptr::null(),
-                my_store.0,
-                &parameters,
-                0,
-                ptr::null_mut(),
-                &mut chain,
-            ) == FALSE
-            {
-                failures.add(error("building a certificate chain"));
-                continue;
-            }
-            let chain = Chain(chain);
-            installed +=
-                unsafe { process_chain(chain.0, ca_store.0, &mut seen_urls, &mut failures) }?;
+            };
+            installed += unsafe {
+                process_chain(
+                    chain.as_ptr(),
+                    ca_store.as_raw(),
+                    &mut seen_urls,
+                    &mut failures,
+                )
+            }?;
         }
 
         log(&format!(

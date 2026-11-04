@@ -203,34 +203,38 @@ impl Certificate {
     }
 }
 
-pub struct Context {
-    pub public: CERT_CONTEXT,
-    pub info: CERT_INFO,
-    pub certificate: Certificate,
-    pub der: Vec<u8>,
+pub(crate) struct Context {
+    public: CERT_CONTEXT,
+    info: CERT_INFO,
+    pub(crate) certificate: Certificate,
+    der: Vec<u8>,
+    issuer_der: Vec<u8>,
+    serial_le: Vec<u8>,
     buffers: Vec<Box<[u8]>>,
     strings: Vec<CString>,
     extensions: Vec<CERT_EXTENSION>,
-    pub properties: Properties,
-    pub private_key: Option<Arc<PrivateKey>>,
-    pub object_path: Option<std::path::PathBuf>,
-    pub key_path: Option<std::path::PathBuf>,
-    pub store_id: Option<usize>,
-    pub view_id: Option<usize>,
-    pub row: i64,
-    pub references: usize,
+    pub(crate) properties: Properties,
+    pub(crate) private_key: Option<Arc<PrivateKey>>,
+    pub(crate) object_path: Option<std::path::PathBuf>,
+    pub(crate) key_path: Option<std::path::PathBuf>,
+    pub(crate) store_id: Option<usize>,
+    pub(crate) view_id: Option<usize>,
+    pub(crate) row: i64,
+    pub(crate) references: usize,
 }
 
 unsafe impl Send for Context {}
 
 impl Context {
-    pub fn new(der: Vec<u8>) -> Result<Box<Self>, ApiError> {
+    pub(crate) fn new(der: Vec<u8>) -> Result<Box<Self>, ApiError> {
         let certificate = Certificate::from_der(&der)?;
         let mut result = Box::new(Self {
             public: CERT_CONTEXT::default(),
             info: CERT_INFO::default(),
             certificate,
             der,
+            issuer_der: Vec::new(),
+            serial_le: Vec::new(),
             buffers: Vec::new(),
             strings: Vec::new(),
             extensions: Vec::new(),
@@ -353,9 +357,11 @@ impl Context {
         )?;
         let mut serial_bytes = serial;
         serial_bytes.reverse();
+        self.serial_le = serial_bytes.clone();
         self.info.SerialNumber = self.keep(serial_bytes);
 
         self.info.SignatureAlgorithm = self.algorithm(signature_oid)?;
+        self.issuer_der = issuer.clone();
         self.info.Issuer = self.keep(issuer);
         self.info.Subject = self.keep(subject);
         self.info.NotBefore = Self::filetime(not_before)?;
@@ -390,32 +396,34 @@ impl Context {
         Ok(())
     }
 
-    pub fn public_ptr(&self) -> *const CERT_CONTEXT {
+    pub(crate) fn public_ptr(&self) -> *const CERT_CONTEXT {
         &self.public
     }
 
-    pub fn issuer_der(&self) -> Vec<u8> {
-        unsafe {
-            std::slice::from_raw_parts(self.info.Issuer.pbData, self.info.Issuer.cbData as usize)
-        }
-        .to_vec()
+    pub(crate) fn set_store_handle(&mut self, handle: HCERTSTORE) {
+        self.public.hCertStore = handle;
     }
 
-    pub fn serial_le(&self) -> Vec<u8> {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.info.SerialNumber.pbData,
-                self.info.SerialNumber.cbData as usize,
-            )
-        }
-        .to_vec()
+    pub(crate) fn der(&self) -> &[u8] {
+        &self.der
     }
 
-    pub fn same_identity(&self, other: &Context) -> bool {
-        self.issuer_der() == other.issuer_der() && self.serial_le() == other.serial_le()
+    pub(crate) fn issuer_der(&self) -> &[u8] {
+        &self.issuer_der
     }
 
-    pub fn simple_name(certificate: &Certificate, subject: bool) -> Result<String, ApiError> {
+    pub(crate) fn serial_le(&self) -> &[u8] {
+        &self.serial_le
+    }
+
+    pub(crate) fn same_identity(&self, other: &Context) -> bool {
+        self.issuer_der == other.issuer_der && self.serial_le == other.serial_le
+    }
+
+    pub(crate) fn simple_name(
+        certificate: &Certificate,
+        subject: bool,
+    ) -> Result<String, ApiError> {
         if subject {
             certificate.subject_text()
         } else {
@@ -423,7 +431,7 @@ impl Context {
         }
     }
 
-    pub fn property_value(&self, property: DWORD) -> Result<Vec<u8>, ApiError> {
+    pub(crate) fn property_value(&self, property: DWORD) -> Result<Vec<u8>, ApiError> {
         require(
             supported_property(property),
             ERROR_NOT_SUPPORTED,

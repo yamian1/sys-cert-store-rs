@@ -1,6 +1,21 @@
+//! Multi-platform certificate-store APIs.
+//!
+//! Prefer the owning types in [`safe`] for ordinary application code. The
+//! Win32-shaped functions re-exported at the crate root remain available for
+//! compatibility, but pointer- and ownership-sensitive operations require an
+//! explicit unsafe boundary:
+//!
+//! ```compile_fail
+//! sys_cert_store::CertFreeCertificateChain(std::ptr::null());
+//! ```
+
 #![allow(non_snake_case)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![deny(clippy::missing_safety_doc)]
+#![deny(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod api_types;
+pub mod safe;
 
 #[cfg(target_os = "linux")]
 pub mod cert;

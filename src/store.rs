@@ -142,10 +142,12 @@ impl State {
         context.store_id = store_id;
         context.view_id = view_id;
         context.row = row;
-        context.public.hCertStore = view_id
-            .or(store_id)
-            .map(store_handle)
-            .unwrap_or(std::ptr::null_mut());
+        context.set_store_handle(
+            view_id
+                .or(store_id)
+                .map(store_handle)
+                .unwrap_or(std::ptr::null_mut()),
+        );
         if let Some(id) = store_id
             && let Some(store) = self.stores.get_mut(&id)
         {
@@ -778,7 +780,7 @@ pub fn insert_material(store: &mut Store, source: &Context) -> Result<i64, ApiEr
         store.memory.insert(
             row,
             Material {
-                der: source.der.clone(),
+                der: source.der().to_vec(),
                 key: source.private_key.clone(),
             },
         );

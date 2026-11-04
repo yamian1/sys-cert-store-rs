@@ -121,36 +121,30 @@ struct Store(HCERTSTORE);
 
 impl Store {
     fn memory() -> Self {
-        Self::new(CertOpenStore(
-            PROVIDER_MEMORY as LPCSTR,
-            0,
-            0,
-            0,
-            ptr::null(),
-        ))
+        // SAFETY: the memory provider accepts a null provider parameter.
+        Self::new(unsafe { CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null()) })
     }
 
     fn sqlite(path: &Path, flags: DWORD) -> Self {
         let provider = CString::new("SysCertSQLite").unwrap();
         let path = cstring(path);
-        Self::new(CertOpenStore(
-            provider.as_ptr(),
-            0,
-            0,
-            flags,
-            path.as_ptr().cast(),
-        ))
+        // SAFETY: the provider and path are live terminated C strings.
+        Self::new(unsafe { CertOpenStore(provider.as_ptr(), 0, 0, flags, path.as_ptr().cast()) })
     }
 
     fn scoped(name: &str, scope: DWORD, flags: DWORD) -> Self {
         let name = wide(name);
-        Self::new(CertOpenStore(
-            PROVIDER_SYSTEM_W as LPCSTR,
-            0,
-            0,
-            scope | flags,
-            name.as_ptr().cast(),
-        ))
+        // SAFETY: the provider constant is valid and `name` is live,
+        // terminated UTF-16.
+        Self::new(unsafe {
+            CertOpenStore(
+                PROVIDER_SYSTEM_W as LPCSTR,
+                0,
+                0,
+                scope | flags,
+                name.as_ptr().cast(),
+            )
+        })
     }
 
     fn new(handle: HCERTSTORE) -> Self {
@@ -175,20 +169,20 @@ impl Context {
     }
 
     fn from_der(der: &[u8]) -> Self {
-        let value =
-            CertCreateCertificateContext(X509_ASN_ENCODING, der.as_ptr(), der.len() as DWORD);
+        // SAFETY: `der` is readable for its reported length.
+        let value = unsafe {
+            CertCreateCertificateContext(X509_ASN_ENCODING, der.as_ptr(), der.len() as DWORD)
+        };
         assert!(!value.is_null(), "{}: {}", last_error(), last_message());
         Self(value)
     }
 
     fn add(store: &Store, source: &Context, disposition: DWORD) -> Self {
         let mut result = ptr::null();
-        assert_ok(CertAddCertificateContextToStore(
-            store.0,
-            source.0,
-            disposition,
-            &mut result,
-        ));
+        // SAFETY: the store and source are live and `result` is writable.
+        assert_ok(unsafe {
+            CertAddCertificateContextToStore(store.0, source.0, disposition, &mut result)
+        });
         Self(result)
     }
 }
@@ -196,7 +190,8 @@ impl Context {
 impl Drop for Context {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            assert_ok(CertFreeCertificateContext(self.0));
+            // SAFETY: this wrapper owns one live context reference.
+            assert_ok(unsafe { CertFreeCertificateContext(self.0) });
         }
     }
 }
@@ -205,7 +200,9 @@ fn count(store: &Store) -> usize {
     let mut count = 0;
     let mut previous = ptr::null();
     loop {
-        let current = CertEnumCertificatesInStore(store.0, previous);
+        // SAFETY: the store is live and `previous` is null or the preceding
+        // enumeration result, which this call consumes.
+        let current = unsafe { CertEnumCertificatesInStore(store.0, previous) };
         if current.is_null() {
             assert_eq!(last_error(), CRYPT_E_NOT_FOUND);
             return count;
@@ -217,19 +214,15 @@ fn count(store: &Store) -> usize {
 
 fn property(context: &Context, id: DWORD) -> Vec<u8> {
     let mut size = 0;
-    assert_ok(CertGetCertificateContextProperty(
-        context.0,
-        id,
-        ptr::null_mut(),
-        &mut size,
-    ));
+    // SAFETY: the context is live and null output requests the required size.
+    assert_ok(unsafe {
+        CertGetCertificateContextProperty(context.0, id, ptr::null_mut(), &mut size)
+    });
     let mut value = vec![0; size as usize];
-    assert_ok(CertGetCertificateContextProperty(
-        context.0,
-        id,
-        value.as_mut_ptr().cast(),
-        &mut size,
-    ));
+    // SAFETY: the context is live and `value` is writable for `size` bytes.
+    assert_ok(unsafe {
+        CertGetCertificateContextProperty(context.0, id, value.as_mut_ptr().cast(), &mut size)
+    });
     value
 }
 
@@ -238,29 +231,28 @@ fn set_property(context: &Context, id: DWORD, value: &[u8]) {
         cbData: value.len() as DWORD,
         pbData: value.as_ptr().cast_mut(),
     };
-    assert_ok(CertSetCertificateContextProperty(
-        context.0,
-        id,
-        0,
-        (&blob as *const CRYPT_DATA_BLOB).cast(),
-    ));
+    // SAFETY: the context and blob remain live for the synchronous call.
+    assert_ok(unsafe {
+        CertSetCertificateContextProperty(
+            context.0,
+            id,
+            0,
+            (&blob as *const CRYPT_DATA_BLOB).cast(),
+        )
+    });
 }
 
 fn material_path(context: &Context, private_key: BOOL) -> PathBuf {
     let mut size = 0;
-    assert_ok(SysCertGetCertificateFilePath(
-        context.0,
-        private_key,
-        ptr::null_mut(),
-        &mut size,
-    ));
+    // SAFETY: the context is live and null output requests the required size.
+    assert_ok(unsafe {
+        SysCertGetCertificateFilePath(context.0, private_key, ptr::null_mut(), &mut size)
+    });
     let mut bytes = vec![0u8; size as usize];
-    assert_ok(SysCertGetCertificateFilePath(
-        context.0,
-        private_key,
-        bytes.as_mut_ptr().cast(),
-        &mut size,
-    ));
+    // SAFETY: the context is live and `bytes` is writable for `size` bytes.
+    assert_ok(unsafe {
+        SysCertGetCertificateFilePath(context.0, private_key, bytes.as_mut_ptr().cast(), &mut size)
+    });
     bytes.pop();
     PathBuf::from(String::from_utf8(bytes).unwrap())
 }
@@ -285,12 +277,16 @@ fn memory_stores_dispositions_and_api_errors() {
     let mut short_size = 1;
     let mut sentinel = 0x5a_u8;
     assert_eq!(
-        CertGetCertificateContextProperty(
-            added.0,
-            CERT_SHA256_HASH_PROP_ID,
-            (&mut sentinel as *mut u8).cast(),
-            &mut short_size,
-        ),
+        // SAFETY: the context is live and the one-byte output buffer matches
+        // the supplied initial size.
+        unsafe {
+            CertGetCertificateContextProperty(
+                added.0,
+                CERT_SHA256_HASH_PROP_ID,
+                (&mut sentinel as *mut u8).cast(),
+                &mut short_size,
+            )
+        },
         FALSE
     );
     assert_eq!(
@@ -299,11 +295,16 @@ fn memory_stores_dispositions_and_api_errors() {
     );
 
     assert_eq!(
-        CertAddCertificateContextToStore(store.0, source.0, CERT_STORE_ADD_NEW, ptr::null_mut(),),
+        // SAFETY: the store and source are live; no returned context is
+        // requested.
+        unsafe {
+            CertAddCertificateContextToStore(store.0, source.0, CERT_STORE_ADD_NEW, ptr::null_mut())
+        },
         FALSE
     );
     assert_eq!(last_error(), CRYPT_E_EXISTS);
-    assert!(CertCreateCertificateContext(0, ptr::null(), 0).is_null());
+    // SAFETY: a zero length permits a null input pointer.
+    assert!(unsafe { CertCreateCertificateContext(0, ptr::null(), 0) }.is_null());
     assert_eq!(last_error(), ERROR_NOT_SUPPORTED);
     assert_eq!(CertCloseStore(ptr::null_mut(), 0), FALSE);
     assert_eq!(last_error(), ERROR_INVALID_HANDLE);
@@ -317,7 +318,11 @@ fn memory_stores_dispositions_and_api_errors() {
         let original = Context::add(&store, &old, CERT_STORE_ADD_ALWAYS);
         if disposition == CERT_STORE_ADD_NEW {
             assert_eq!(
-                CertAddCertificateContextToStore(store.0, new.0, disposition, ptr::null_mut(),),
+                // SAFETY: the store and source are live; no returned context
+                // is requested.
+                unsafe {
+                    CertAddCertificateContextToStore(store.0, new.0, disposition, ptr::null_mut())
+                },
                 FALSE
             );
             assert_eq!(last_error(), CRYPT_E_EXISTS);
@@ -363,17 +368,14 @@ fn persistent_store_round_trip_and_static_rust_calls() {
                 .map(|v| String::from_utf8(v).unwrap())
                 .unwrap()
         );
-        assert_ok(CertControlStore(
-            store.0,
-            0,
-            CERT_STORE_CTRL_COMMIT,
-            ptr::null(),
-        ));
+        // SAFETY: the store is live and this control code accepts null data.
+        assert_ok(unsafe { CertControlStore(store.0, 0, CERT_STORE_CTRL_COMMIT, ptr::null()) });
     }
     assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     {
         let store = Store::sqlite(&path, CERT_STORE_OPEN_EXISTING_FLAG);
-        let raw = CertEnumCertificatesInStore(store.0, ptr::null());
+        // SAFETY: the store is live and null starts a new enumeration.
+        let raw = unsafe { CertEnumCertificatesInStore(store.0, ptr::null()) };
         assert!(!raw.is_null());
         let cert = Context(raw);
         assert_eq!(property(&cert, CERT_FIRST_USER_PROP_ID), [9, 8, 7]);
@@ -387,13 +389,16 @@ fn persistent_store_round_trip_and_static_rust_calls() {
     let provider = CString::new("SysCertSQLite").unwrap();
     let missing_c = cstring(&missing);
     assert!(
-        CertOpenStore(
-            provider.as_ptr(),
-            0,
-            0,
-            CERT_STORE_OPEN_EXISTING_FLAG,
-            missing_c.as_ptr().cast(),
-        )
+        // SAFETY: the provider and missing path are live terminated C strings.
+        unsafe {
+            CertOpenStore(
+                provider.as_ptr(),
+                0,
+                0,
+                CERT_STORE_OPEN_EXISTING_FLAG,
+                missing_c.as_ptr().cast(),
+            )
+        }
         .is_null()
     );
     assert_eq!(last_error(), ERROR_FILE_NOT_FOUND);
@@ -431,26 +436,27 @@ fn pfx_import_and_private_material() {
     let wrong = wide("wrong");
     let store = Store::sqlite(&temp.path().join("MY.db"), 0);
     assert_eq!(
-        SysCertImportPfxToStore(store.0, &blob, wrong.as_ptr(), 0),
+        // SAFETY: the store, PFX blob, and terminated password are live.
+        unsafe { SysCertImportPfxToStore(store.0, &blob, wrong.as_ptr(), 0) },
         FALSE
     );
     assert_eq!(last_error(), ERROR_INVALID_DATA);
-    assert_ok(SysCertImportPfxToStore(
-        store.0,
-        &blob,
-        password.as_ptr(),
-        0,
-    ));
+    // SAFETY: the store, PFX blob, and terminated password are live.
+    assert_ok(unsafe { SysCertImportPfxToStore(store.0, &blob, password.as_ptr(), 0) });
     assert_eq!(count(&store), 2);
     let subject = wide("PFX leaf");
-    let raw = CertFindCertificateInStore(
-        store.0,
-        X509_ASN_ENCODING,
-        0,
-        CERT_FIND_SUBJECT_STR_W,
-        subject.as_ptr().cast(),
-        ptr::null(),
-    );
+    // SAFETY: the store and terminated UTF-16 subject are live; null starts a
+    // new search.
+    let raw = unsafe {
+        CertFindCertificateInStore(
+            store.0,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_STR_W,
+            subject.as_ptr().cast(),
+            ptr::null(),
+        )
+    };
     let leaf_context = Context(raw);
     let cert_path = material_path(&leaf_context, FALSE);
     let key_path = material_path(&leaf_context, TRUE);
@@ -459,25 +465,32 @@ fn pfx_import_and_private_material() {
     let recovered = PKey::private_key_from_pem(&fs::read(key_path).unwrap()).unwrap();
     assert!(recovered.public_eq(&leaf_key));
 
-    let name_size = CertGetNameStringA(
-        leaf_context.0,
-        CERT_NAME_RDN_TYPE,
-        0,
-        ptr::null(),
-        ptr::null_mut(),
-        0,
-    );
-    assert!(name_size > 1);
-    let mut name = vec![0i8; name_size as usize];
-    assert_eq!(
+    // SAFETY: the context is live and null output requests the required size.
+    let name_size = unsafe {
         CertGetNameStringA(
             leaf_context.0,
             CERT_NAME_RDN_TYPE,
             0,
             ptr::null(),
-            name.as_mut_ptr(),
-            name_size,
-        ),
+            ptr::null_mut(),
+            0,
+        )
+    };
+    assert!(name_size > 1);
+    let mut name = vec![0i8; name_size as usize];
+    assert_eq!(
+        // SAFETY: the context is live and `name` is writable for `name_size`
+        // elements.
+        unsafe {
+            CertGetNameStringA(
+                leaf_context.0,
+                CERT_NAME_RDN_TYPE,
+                0,
+                ptr::null(),
+                name.as_mut_ptr(),
+                name_size,
+            )
+        },
         name_size
     );
     assert!(
@@ -491,16 +504,19 @@ fn pfx_import_and_private_material() {
         ..CERT_CHAIN_PARA::default()
     };
     let mut chain_context = ptr::null();
-    assert_ok(CertGetCertificateChain(
-        ptr::null_mut(),
-        leaf_context.0,
-        ptr::null(),
-        store.0,
-        &parameters,
-        0,
-        ptr::null_mut(),
-        &mut chain_context,
-    ));
+    // SAFETY: all input objects and the output slot remain live for the call.
+    assert_ok(unsafe {
+        CertGetCertificateChain(
+            ptr::null_mut(),
+            leaf_context.0,
+            ptr::null(),
+            store.0,
+            &parameters,
+            0,
+            ptr::null_mut(),
+            &mut chain_context,
+        )
+    });
     assert!(!chain_context.is_null());
     unsafe {
         assert_eq!((*chain_context).cChain, 1);
@@ -514,63 +530,85 @@ fn pfx_import_and_private_material() {
         cbSize: std::mem::size_of::<CERT_CHAIN_POLICY_STATUS>() as DWORD,
         ..CERT_CHAIN_POLICY_STATUS::default()
     };
-    assert_ok(CertVerifyCertificateChainPolicy(
-        CERT_CHAIN_POLICY_BASE as LPCSTR,
-        chain_context,
-        &policy_parameters,
-        &mut policy_status,
-    ));
+    // SAFETY: the chain and initialized policy input/output structures are
+    // live.
+    assert_ok(unsafe {
+        CertVerifyCertificateChainPolicy(
+            CERT_CHAIN_POLICY_BASE as LPCSTR,
+            chain_context,
+            &policy_parameters,
+            &mut policy_status,
+        )
+    });
     assert_eq!(policy_status.dwError, ERROR_SUCCESS);
-    CertFreeCertificateChain(chain_context);
+    // SAFETY: `chain_context` is the live allocation returned above.
+    unsafe { CertFreeCertificateChain(chain_context) };
 
     let mut exported = CRYPT_DATA_BLOB::default();
-    assert_ok(PFXExportCertStoreEx(
-        store.0,
-        &mut exported,
-        password.as_ptr(),
-        ptr::null_mut(),
-        EXPORT_PRIVATE_KEYS,
-    ));
+    // SAFETY: the store, output blob, and terminated password are live; null
+    // blob data requests the required size.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut exported,
+            password.as_ptr(),
+            ptr::null_mut(),
+            EXPORT_PRIVATE_KEYS,
+        )
+    });
     let mut exported_bytes = vec![0u8; exported.cbData as usize];
     exported.pbData = exported_bytes.as_mut_ptr();
-    assert_ok(PFXExportCertStoreEx(
-        store.0,
-        &mut exported,
-        password.as_ptr(),
-        ptr::null_mut(),
-        EXPORT_PRIVATE_KEYS,
-    ));
+    // SAFETY: the blob describes the writable `exported_bytes` buffer.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut exported,
+            password.as_ptr(),
+            ptr::null_mut(),
+            EXPORT_PRIVATE_KEYS,
+        )
+    });
     let exported_pfx = Pkcs12::from_der(&exported_bytes).unwrap();
     let exported_material = exported_pfx.parse2("password").unwrap();
     assert!(exported_material.pkey.unwrap().public_eq(&leaf_key));
     assert_eq!(exported_material.ca.unwrap().len(), 1);
 
     let mut pkcs7 = CRYPT_DATA_BLOB::default();
-    assert_ok(CertSaveStore(
-        store.0,
-        PKCS_7_ASN_ENCODING,
-        CERT_STORE_SAVE_AS_PKCS7,
-        CERT_STORE_SAVE_TO_MEMORY,
-        (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
-        0,
-    ));
+    // SAFETY: the store and writable blob are live; null blob data requests
+    // the required size.
+    assert_ok(unsafe {
+        CertSaveStore(
+            store.0,
+            PKCS_7_ASN_ENCODING,
+            CERT_STORE_SAVE_AS_PKCS7,
+            CERT_STORE_SAVE_TO_MEMORY,
+            (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
+            0,
+        )
+    });
     let mut pkcs7_bytes = vec![0u8; pkcs7.cbData as usize];
     pkcs7.pbData = pkcs7_bytes.as_mut_ptr();
-    assert_ok(CertSaveStore(
-        store.0,
-        PKCS_7_ASN_ENCODING,
-        CERT_STORE_SAVE_AS_PKCS7,
-        CERT_STORE_SAVE_TO_MEMORY,
-        (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
-        0,
-    ));
-    let pkcs7_store = Store::new(CertOpenStore(
-        PROVIDER_PKCS7 as LPCSTR,
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        0,
-        CERT_STORE_READONLY_FLAG,
-        (&pkcs7 as *const CRYPT_DATA_BLOB).cast(),
-    ));
+    // SAFETY: the blob describes the writable `pkcs7_bytes` buffer.
+    assert_ok(unsafe {
+        CertSaveStore(
+            store.0,
+            PKCS_7_ASN_ENCODING,
+            CERT_STORE_SAVE_AS_PKCS7,
+            CERT_STORE_SAVE_TO_MEMORY,
+            (&mut pkcs7 as *mut CRYPT_DATA_BLOB).cast(),
+            0,
+        )
+    });
+    // SAFETY: `pkcs7` describes the live encoded buffer.
+    let pkcs7_store = Store::new(unsafe {
+        CertOpenStore(
+            PROVIDER_PKCS7 as LPCSTR,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            CERT_STORE_READONLY_FLAG,
+            (&pkcs7 as *const CRYPT_DATA_BLOB).cast(),
+        )
+    });
     assert_eq!(count(&pkcs7_store), 2);
 }
 
@@ -606,37 +644,39 @@ fn native_trust_store_and_update_errors() {
         rootPath: root_c.as_ptr(),
     };
     let provider = CString::new("SysCertNative").unwrap();
-    let store = Store::new(CertOpenStore(
-        provider.as_ptr(),
-        0,
-        0,
-        0,
-        (&options as *const SYS_CERT_NATIVE_OPTIONS).cast(),
-    ));
+    // SAFETY: the provider and native options remain live for the synchronous
+    // open call.
+    let store = Store::new(unsafe {
+        CertOpenStore(
+            provider.as_ptr(),
+            0,
+            0,
+            0,
+            (&options as *const SYS_CERT_NATIVE_OPTIONS).cast(),
+        )
+    });
     assert_eq!(count(&store), 1);
     let context = Context::from_x509(&x509);
     assert_eq!(
-        SysCertUpdateTrustAnchor(context.0, TRUE, &options, 0),
+        // SAFETY: the context and native options are live.
+        unsafe { SysCertUpdateTrustAnchor(context.0, TRUE, &options, 0) },
         FALSE
     );
     assert_eq!(last_error(), ERROR_ACCESS_DENIED);
-    assert_ok(SysCertUpdateTrustAnchor(
-        context.0,
-        TRUE,
-        &options,
-        SYS_CERT_TRUST_UPDATE_ALLOW,
-    ));
+    // SAFETY: the context and native options are live.
+    assert_ok(unsafe {
+        SysCertUpdateTrustAnchor(context.0, TRUE, &options, SYS_CERT_TRUST_UPDATE_ALLOW)
+    });
     assert_eq!(
-        SysCertUpdateTrustAnchor(context.0, TRUE, &options, SYS_CERT_TRUST_UPDATE_ALLOW,),
+        // SAFETY: the context and native options are live.
+        unsafe { SysCertUpdateTrustAnchor(context.0, TRUE, &options, SYS_CERT_TRUST_UPDATE_ALLOW) },
         FALSE
     );
     assert_eq!(last_error(), CRYPT_E_EXISTS);
-    assert_ok(SysCertUpdateTrustAnchor(
-        context.0,
-        FALSE,
-        &options,
-        SYS_CERT_TRUST_UPDATE_ALLOW,
-    ));
+    // SAFETY: the context and native options are live.
+    assert_ok(unsafe {
+        SysCertUpdateTrustAnchor(context.0, FALSE, &options, SYS_CERT_TRUST_UPDATE_ALLOW)
+    });
 }
 
 #[test]
@@ -678,7 +718,9 @@ fn threading_and_system_scope() {
         machineStoreDirectory: machine.as_ptr(),
         systemRoot: system_c.as_ptr(),
     };
-    assert_ok(SysCertConfigureSystemStores(&configuration));
+    // SAFETY: the configuration and its C strings remain live while stores
+    // use it.
+    assert_ok(unsafe { SysCertConfigureSystemStores(&configuration) });
     {
         let user_my = Store::scoped("MY", CERT_SYSTEM_STORE_CURRENT_USER, 0);
         let machine_my = Store::scoped("MY", CERT_SYSTEM_STORE_LOCAL_MACHINE, 0);
@@ -692,32 +734,31 @@ fn threading_and_system_scope() {
         let user_added = Context::add(&user_my, &source, CERT_STORE_ADD_ALWAYS);
         let machine_added = Context::add(&machine_my, &source, CERT_STORE_ADD_ALWAYS);
         let mut location = 0;
-        assert_ok(SysCertGetCertificateStoreLocation(
-            user_added.0,
-            &mut location,
-        ));
+        // SAFETY: the context is live and `location` is writable.
+        assert_ok(unsafe { SysCertGetCertificateStoreLocation(user_added.0, &mut location) });
         assert_eq!(location, CERT_SYSTEM_STORE_CURRENT_USER);
-        assert_ok(SysCertGetCertificateStoreLocation(
-            machine_added.0,
-            &mut location,
-        ));
+        // SAFETY: the context is live and `location` is writable.
+        assert_ok(unsafe { SysCertGetCertificateStoreLocation(machine_added.0, &mut location) });
         assert_eq!(location, CERT_SYSTEM_STORE_LOCAL_MACHINE);
         let intermediate = certificate(&root_key, 43, "Intermediate", true, None, -60, None);
         let intermediate = Context::from_x509(&intermediate);
         let _machine_intermediate = Context::add(&machine_ca, &intermediate, CERT_STORE_ADD_ALWAYS);
         assert_eq!(count(&user_ca), 1);
-        let inherited = Context(CertEnumCertificatesInStore(user_ca.0, ptr::null()));
-        assert_ok(SysCertGetCertificateStoreLocation(
-            inherited.0,
-            &mut location,
-        ));
+        // SAFETY: the store is live and null starts a new enumeration.
+        let inherited = Context(unsafe { CertEnumCertificatesInStore(user_ca.0, ptr::null()) });
+        // SAFETY: the context is live and `location` is writable.
+        assert_ok(unsafe { SysCertGetCertificateStoreLocation(inherited.0, &mut location) });
         assert_eq!(location, CERT_SYSTEM_STORE_LOCAL_MACHINE);
-        let duplicate = CertDuplicateCertificateContext(inherited.0);
+        // SAFETY: `inherited` owns a live context.
+        let duplicate = unsafe { CertDuplicateCertificateContext(inherited.0) };
         assert!(!duplicate.is_null());
-        assert_eq!(CertDeleteCertificateFromStore(duplicate), FALSE);
+        // SAFETY: `duplicate` is an independently owned live reference and is
+        // consumed by this call.
+        assert_eq!(unsafe { CertDeleteCertificateFromStore(duplicate) }, FALSE);
         assert_eq!(last_error(), ERROR_ACCESS_DENIED);
     }
-    assert_ok(SysCertConfigureSystemStores(ptr::null()));
+    // SAFETY: null restores the default configuration.
+    assert_ok(unsafe { SysCertConfigureSystemStores(ptr::null()) });
 }
 
 fn generate_crl(temp: &Path, issuer: &X509, issuer_key: &PKey<Private>) -> Vec<u8> {
@@ -802,7 +843,9 @@ fn dotnet_crl_cache_regression() {
         machineStoreDirectory: machine.as_ptr(),
         systemRoot: system_c.as_ptr(),
     };
-    assert_ok(SysCertConfigureSystemStores(&config));
+    // SAFETY: the configuration and its C strings remain live while stores
+    // use it.
+    assert_ok(unsafe { SysCertConfigureSystemStores(&config) });
     {
         let personal = Store::scoped("MY", CERT_SYSTEM_STORE_CURRENT_USER, 0);
         let leaf = Context::from_x509(&leaf);
@@ -818,7 +861,9 @@ fn dotnet_crl_cache_regression() {
     }
     let account = unsafe { libc::getpwuid(libc::geteuid()) };
     assert!(!account.is_null());
-    assert_ok(SysCertPopulateDotNetCrlCache(unsafe { (*account).pw_name }));
+    // SAFETY: `account` is live and `pw_name` is a terminated C string owned
+    // by the process password database.
+    assert_ok(unsafe { SysCertPopulateDotNetCrlCache((*account).pw_name) });
     server.join().unwrap();
     unsafe {
         match previous_home {
@@ -842,10 +887,13 @@ fn dotnet_crl_cache_regression() {
     let cached = openssl::x509::X509Crl::from_pem(&fs::read(cached).unwrap()).unwrap();
     let expected = openssl::x509::X509Crl::from_pem(&crl).unwrap();
     assert_eq!(cached.to_der().unwrap(), expected.to_der().unwrap());
-    assert_ok(SysCertConfigureSystemStores(ptr::null()));
+    // SAFETY: null restores the default configuration.
+    assert_ok(unsafe { SysCertConfigureSystemStores(ptr::null()) });
     let invalid = [0xff_u8, 0];
     assert_eq!(
-        SysCertPopulateDotNetCrlCache(invalid.as_ptr().cast()),
+        // SAFETY: `invalid` is a live terminated byte string; the test
+        // intentionally verifies invalid UTF-8 handling.
+        unsafe { SysCertPopulateDotNetCrlCache(invalid.as_ptr().cast()) },
         FALSE
     );
     assert_eq!(last_error(), E_INVALIDARG);

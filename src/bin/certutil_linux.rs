@@ -263,7 +263,9 @@ fn configure(options: &Options) -> Result<(), String> {
             .map_or(ptr::null(), |value| value.as_ptr()),
     };
     api(
-        SysCertConfigureSystemStores(&configuration) != FALSE,
+        // SAFETY: the configuration and all optional C strings remain live
+        // for the synchronous call.
+        unsafe { SysCertConfigureSystemStores(&configuration) } != FALSE,
         (),
         "Configure store paths",
     )
@@ -282,7 +284,8 @@ struct CertificateContext(*const CERT_CONTEXT);
 impl Drop for CertificateContext {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            CertFreeCertificateContext(self.0);
+            // SAFETY: this wrapper owns one live context reference.
+            unsafe { CertFreeCertificateContext(self.0) };
         }
     }
 }
@@ -290,7 +293,8 @@ impl Drop for CertificateContext {
 struct CertificateChain(*const CERT_CHAIN_CONTEXT);
 impl Drop for CertificateChain {
     fn drop(&mut self) {
-        CertFreeCertificateChain(self.0);
+        // SAFETY: this wrapper owns one live chain allocation.
+        unsafe { CertFreeCertificateChain(self.0) };
     }
 }
 
@@ -319,13 +323,17 @@ fn open_store(options: &Options, name: &str, write: bool) -> Result<Store, Strin
         } else {
             0
         };
-    let handle = CertOpenStore(
-        PROVIDER_SYSTEM_A as LPCSTR,
-        0,
-        0,
-        flags,
-        name.as_ptr().cast(),
-    );
+    // SAFETY: the provider constant is valid and `name` is a live terminated
+    // C string for the synchronous call.
+    let handle = unsafe {
+        CertOpenStore(
+            PROVIDER_SYSTEM_A as LPCSTR,
+            0,
+            0,
+            flags,
+            name.as_ptr().cast(),
+        )
+    };
     api(!handle.is_null(), Store(handle), "Open store")
 }
 
@@ -333,14 +341,17 @@ fn entries(store: &Store) -> Result<Vec<Entry>, String> {
     let mut result = Vec::new();
     let mut cursor = ptr::null();
     loop {
-        cursor = CertEnumCertificatesInStore(store.0, cursor);
+        // SAFETY: the store is live and `cursor` is null or the preceding
+        // enumeration result, which this call consumes.
+        cursor = unsafe { CertEnumCertificatesInStore(store.0, cursor) };
         if cursor.is_null() {
             if GetLastError() == CRYPT_E_NOT_FOUND {
                 break;
             }
             return api(false, result, "Enumerate certificates");
         }
-        let retained = CertDuplicateCertificateContext(cursor);
+        // SAFETY: `cursor` is live until the next enumeration call.
+        let retained = unsafe { CertDuplicateCertificateContext(cursor) };
         api(!retained.is_null(), (), "Retain certificate")?;
         let public = unsafe { &*retained };
         let der = unsafe {
@@ -349,7 +360,8 @@ fn entries(store: &Store) -> Result<Vec<Entry>, String> {
         let certificate = NativeCertificate::from_der(der).map_err(|error| error.message)?;
         let mut origin = 0;
         api(
-            SysCertGetCertificateStoreLocation(retained, &mut origin) != FALSE,
+            // SAFETY: `retained` is live and `origin` is writable.
+            unsafe { SysCertGetCertificateStoreLocation(retained, &mut origin) } != FALSE,
             (),
             "Get certificate location",
         )?;
@@ -369,25 +381,33 @@ fn hex_bytes(value: &[u8]) -> String {
 
 fn certificate_name(context: *const CERT_CONTEXT, issuer: bool) -> Result<String, String> {
     let flags = if issuer { CERT_NAME_ISSUER_FLAG } else { 0 };
-    let size = CertGetNameStringA(
-        context,
-        CERT_NAME_RDN_TYPE,
-        flags,
-        ptr::null(),
-        ptr::null_mut(),
-        0,
-    );
-    api(size != 0, (), "Size certificate name")?;
-    let mut output = vec![0i8; size as usize];
-    api(
+    // SAFETY: `context` is supplied by a live entry and null output requests
+    // the required size.
+    let size = unsafe {
         CertGetNameStringA(
             context,
             CERT_NAME_RDN_TYPE,
             flags,
             ptr::null(),
-            output.as_mut_ptr(),
-            size,
-        ) != 0,
+            ptr::null_mut(),
+            0,
+        )
+    };
+    api(size != 0, (), "Size certificate name")?;
+    let mut output = vec![0i8; size as usize];
+    api(
+        // SAFETY: `context` is live and `output` is writable for `size`
+        // elements.
+        unsafe {
+            CertGetNameStringA(
+                context,
+                CERT_NAME_RDN_TYPE,
+                flags,
+                ptr::null(),
+                output.as_mut_ptr(),
+                size,
+            )
+        } != 0,
         (),
         "Format certificate name",
     )?;
@@ -400,25 +420,33 @@ fn certificate_pem(certificate: &NativeCertificate) -> Result<Vec<u8>, String> {
     let der = certificate.to_der();
     let mut size = 0;
     api(
-        CryptBinaryToStringA(
-            der.as_ptr(),
-            der.len() as DWORD,
-            CRYPT_STRING_BASE64HEADER,
-            ptr::null_mut(),
-            &mut size,
-        ) != FALSE,
+        // SAFETY: `der` is readable for its reported length and null output
+        // requests the required size.
+        unsafe {
+            CryptBinaryToStringA(
+                der.as_ptr(),
+                der.len() as DWORD,
+                CRYPT_STRING_BASE64HEADER,
+                ptr::null_mut(),
+                &mut size,
+            )
+        } != FALSE,
         (),
         "Size certificate PEM",
     )?;
     let mut output = vec![0i8; size as usize];
     api(
-        CryptBinaryToStringA(
-            der.as_ptr(),
-            der.len() as DWORD,
-            CRYPT_STRING_BASE64HEADER,
-            output.as_mut_ptr(),
-            &mut size,
-        ) != FALSE,
+        // SAFETY: `der` is readable and `output` is writable for the size
+        // returned by the preceding call.
+        unsafe {
+            CryptBinaryToStringA(
+                der.as_ptr(),
+                der.len() as DWORD,
+                CRYPT_STRING_BASE64HEADER,
+                output.as_mut_ptr(),
+                &mut size,
+            )
+        } != FALSE,
         (),
         "Encode certificate PEM",
     )?;
@@ -490,18 +518,24 @@ fn pkcs7_certificates(data: &[u8]) -> Result<Vec<NativeCertificate>, String> {
         cbData: data.len() as DWORD,
         pbData: data.as_mut_ptr(),
     };
-    let store = Store(CertOpenStore(
-        PROVIDER_PKCS7 as LPCSTR,
-        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
-        0,
-        CERT_STORE_READONLY_FLAG,
-        (&blob as *const CRYPT_DATA_BLOB).cast(),
-    ));
+    // SAFETY: the blob describes the live `data` buffer for the synchronous
+    // open operation.
+    let store = Store(unsafe {
+        CertOpenStore(
+            PROVIDER_PKCS7 as LPCSTR,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            CERT_STORE_READONLY_FLAG,
+            (&blob as *const CRYPT_DATA_BLOB).cast(),
+        )
+    });
     api(!store.0.is_null(), (), "Open PKCS#7 certificate store")?;
     let mut result = Vec::new();
     let mut cursor = ptr::null();
     loop {
-        cursor = CertEnumCertificatesInStore(store.0, cursor);
+        // SAFETY: the store is live and `cursor` is null or the preceding
+        // enumeration result, which this call consumes.
+        cursor = unsafe { CertEnumCertificatesInStore(store.0, cursor) };
         if cursor.is_null() {
             if GetLastError() == CRYPT_E_NOT_FOUND {
                 break;
@@ -521,29 +555,37 @@ fn decode_pem(block: &str) -> Result<Vec<u8>, String> {
     let block = CString::new(block).map_err(|_| "PEM block contains NUL")?;
     let mut size = 0;
     api(
-        CryptStringToBinaryA(
-            block.as_ptr(),
-            0,
-            CRYPT_STRING_ANY,
-            ptr::null_mut(),
-            &mut size,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        ) != FALSE,
+        // SAFETY: `block` is a live terminated C string and null output
+        // requests the decoded size.
+        unsafe {
+            CryptStringToBinaryA(
+                block.as_ptr(),
+                0,
+                CRYPT_STRING_ANY,
+                ptr::null_mut(),
+                &mut size,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        } != FALSE,
         (),
         "Size decoded PEM",
     )?;
     let mut output = vec![0u8; size as usize];
     api(
-        CryptStringToBinaryA(
-            block.as_ptr(),
-            0,
-            CRYPT_STRING_ANY,
-            output.as_mut_ptr(),
-            &mut size,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        ) != FALSE,
+        // SAFETY: `block` remains live and `output` is writable for the size
+        // returned by the preceding call.
+        unsafe {
+            CryptStringToBinaryA(
+                block.as_ptr(),
+                0,
+                CRYPT_STRING_ANY,
+                output.as_mut_ptr(),
+                &mut size,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        } != FALSE,
         (),
         "Decode PEM",
     )?;
@@ -746,13 +788,9 @@ fn chain(
     if no_chain || self_signed(leaf) {
         return Ok(Vec::new());
     }
-    let candidates = Store(CertOpenStore(
-        PROVIDER_MEMORY as LPCSTR,
-        0,
-        0,
-        0,
-        ptr::null(),
-    ));
+    // SAFETY: the memory provider accepts a null provider parameter.
+    let candidates =
+        Store(unsafe { CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null()) });
     api(
         !candidates.0.is_null(),
         (),
@@ -760,12 +798,16 @@ fn chain(
     )?;
     for entry in source {
         api(
-            CertAddCertificateContextToStore(
-                candidates.0,
-                entry.context.0,
-                CERT_STORE_ADD_ALWAYS,
-                ptr::null_mut(),
-            ) != FALSE,
+            // SAFETY: the store and source context are live; no returned
+            // context is requested.
+            unsafe {
+                CertAddCertificateContextToStore(
+                    candidates.0,
+                    entry.context.0,
+                    CERT_STORE_ADD_ALWAYS,
+                    ptr::null_mut(),
+                )
+            } != FALSE,
             (),
             "Add certificate-chain candidate",
         )?;
@@ -776,12 +818,16 @@ fn chain(
         }
         for entry in entries(&open_store(options, extra, false)?)? {
             api(
-                CertAddCertificateContextToStore(
-                    candidates.0,
-                    entry.context.0,
-                    CERT_STORE_ADD_ALWAYS,
-                    ptr::null_mut(),
-                ) != FALSE,
+                // SAFETY: the store and source context are live; no returned
+                // context is requested.
+                unsafe {
+                    CertAddCertificateContextToStore(
+                        candidates.0,
+                        entry.context.0,
+                        CERT_STORE_ADD_ALWAYS,
+                        ptr::null_mut(),
+                    )
+                } != FALSE,
                 (),
                 "Add system certificate-chain candidate",
             )?;
@@ -797,16 +843,20 @@ fn chain(
     };
     let mut raw_chain = ptr::null();
     api(
-        CertGetCertificateChain(
-            ptr::null_mut(),
-            leaf_context.context.0,
-            ptr::null(),
-            candidates.0,
-            &parameters,
-            0,
-            ptr::null_mut(),
-            &mut raw_chain,
-        ) != FALSE,
+        // SAFETY: the context, store, parameters, and output slot remain live
+        // for the synchronous chain build.
+        unsafe {
+            CertGetCertificateChain(
+                ptr::null_mut(),
+                leaf_context.context.0,
+                ptr::null(),
+                candidates.0,
+                &parameters,
+                0,
+                ptr::null_mut(),
+                &mut raw_chain,
+            )
+        } != FALSE,
         (),
         "Build certificate chain",
     )?;
@@ -820,12 +870,16 @@ fn chain(
         ..CERT_CHAIN_POLICY_STATUS::default()
     };
     api(
-        CertVerifyCertificateChainPolicy(
-            CERT_CHAIN_POLICY_BASE as LPCSTR,
-            chain.0,
-            &policy_parameters,
-            &mut policy_status,
-        ) != FALSE,
+        // SAFETY: the chain and initialized policy input/output structures are
+        // live for the synchronous call.
+        unsafe {
+            CertVerifyCertificateChainPolicy(
+                CERT_CHAIN_POLICY_BASE as LPCSTR,
+                chain.0,
+                &policy_parameters,
+                &mut policy_status,
+            )
+        } != FALSE,
         (),
         "Verify certificate-chain policy",
     )?;
@@ -878,12 +932,16 @@ fn execute(mut options: Options) -> Result<(), String> {
     match options.command.as_str() {
         "-enumstore" => {
             api(
-                CertEnumSystemStore(
-                    options.scope,
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    Some(print_store),
-                ) != FALSE,
+                // SAFETY: the callback has the required ABI and does not
+                // retain the names supplied during enumeration.
+                unsafe {
+                    CertEnumSystemStore(
+                        options.scope,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        Some(print_store),
+                    )
+                } != FALSE,
                 (),
                 "Enumerate stores",
             )?;
@@ -894,11 +952,14 @@ fn execute(mut options: Options) -> Result<(), String> {
                 .enumerate()
             {
                 let der = certificate.to_der();
-                let context = CertificateContext(CertCreateCertificateContext(
-                    X509_ASN_ENCODING,
-                    der.as_ptr(),
-                    der.len() as DWORD,
-                ));
+                // SAFETY: `der` is readable for its reported length.
+                let context = CertificateContext(unsafe {
+                    CertCreateCertificateContext(
+                        X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as DWORD,
+                    )
+                });
                 api(!context.0.is_null(), (), "Create certificate context")?;
                 show(context.0, certificate, index, options.verbose, None)?;
             }
@@ -908,24 +969,27 @@ fn execute(mut options: Options) -> Result<(), String> {
             let store = open_store(&options, &options.args[0], true)?;
             for certificate in parsed {
                 let der = certificate.to_der();
-                let context = CertCreateCertificateContext(
-                    X509_ASN_ENCODING,
-                    der.as_ptr(),
-                    der.len() as DWORD,
-                );
+                // SAFETY: `der` is readable for its reported length.
+                let context = unsafe {
+                    CertCreateCertificateContext(
+                        X509_ASN_ENCODING,
+                        der.as_ptr(),
+                        der.len() as DWORD,
+                    )
+                };
                 api(!context.is_null(), (), "Validate certificate")?;
                 let disposition = if options.force {
                     CERT_STORE_ADD_REPLACE_EXISTING
                 } else {
                     CERT_STORE_ADD_NEW
                 };
-                let added = CertAddCertificateContextToStore(
-                    store.0,
-                    context,
-                    disposition,
-                    ptr::null_mut(),
-                );
-                CertFreeCertificateContext(context);
+                // SAFETY: the store and context are live; no returned context
+                // is requested.
+                let added = unsafe {
+                    CertAddCertificateContextToStore(store.0, context, disposition, ptr::null_mut())
+                };
+                // SAFETY: this is the live reference returned by creation.
+                unsafe { CertFreeCertificateContext(context) };
                 api(
                     added != FALSE,
                     (),
@@ -958,7 +1022,10 @@ fn execute(mut options: Options) -> Result<(), String> {
                 CRYPT_MACHINE_KEYSET
             };
             api(
-                SysCertImportPfxToStore(store.0, &blob, wide_secret.as_ptr(), flags) != FALSE,
+                // SAFETY: the store, PFX blob, and terminated password remain
+                // live for the synchronous import.
+                unsafe { SysCertImportPfxToStore(store.0, &blob, wide_secret.as_ptr(), flags) }
+                    != FALSE,
                 (),
                 "Import PFX",
             )?;
@@ -1019,9 +1086,12 @@ fn execute(mut options: Options) -> Result<(), String> {
                 if entry.origin != options.scope {
                     return Err("Inherited certificates cannot be deleted from a user view; open the computer store explicitly".into());
                 }
-                let retained = CertDuplicateCertificateContext(entry.context.0);
+                // SAFETY: the selected entry owns a live context reference.
+                let retained = unsafe { CertDuplicateCertificateContext(entry.context.0) };
                 api(
-                    CertDeleteCertificateFromStore(retained) != FALSE,
+                    // SAFETY: `retained` is an independently owned live
+                    // reference consumed by this call.
+                    unsafe { CertDeleteCertificateFromStore(retained) } != FALSE,
                     (),
                     "Delete certificate",
                 )?;
@@ -1036,39 +1106,48 @@ fn execute(mut options: Options) -> Result<(), String> {
                     no_chain,
                     no_root,
                 )?;
-                let export_store = Store(CertOpenStore(
-                    PROVIDER_MEMORY as LPCSTR,
-                    0,
-                    0,
-                    0,
-                    ptr::null(),
-                ));
+                // SAFETY: the memory provider accepts a null provider
+                // parameter.
+                let export_store = Store(unsafe {
+                    CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null())
+                });
                 api(!export_store.0.is_null(), (), "Create PFX export store")?;
                 api(
-                    CertAddCertificateContextToStore(
-                        export_store.0,
-                        entry.context.0,
-                        CERT_STORE_ADD_ALWAYS,
-                        ptr::null_mut(),
-                    ) != FALSE,
+                    // SAFETY: the store and leaf context are live; no returned
+                    // context is requested.
+                    unsafe {
+                        CertAddCertificateContextToStore(
+                            export_store.0,
+                            entry.context.0,
+                            CERT_STORE_ADD_ALWAYS,
+                            ptr::null_mut(),
+                        )
+                    } != FALSE,
                     (),
                     "Add PFX leaf certificate",
                 )?;
                 for issuer in &issuers {
                     let der = issuer.to_der();
-                    let context = CertificateContext(CertCreateCertificateContext(
-                        X509_ASN_ENCODING,
-                        der.as_ptr(),
-                        der.len() as DWORD,
-                    ));
+                    // SAFETY: `der` is readable for its reported length.
+                    let context = CertificateContext(unsafe {
+                        CertCreateCertificateContext(
+                            X509_ASN_ENCODING,
+                            der.as_ptr(),
+                            der.len() as DWORD,
+                        )
+                    });
                     api(!context.0.is_null(), (), "Create PFX issuer context")?;
                     api(
-                        CertAddCertificateContextToStore(
-                            export_store.0,
-                            context.0,
-                            CERT_STORE_ADD_ALWAYS,
-                            ptr::null_mut(),
-                        ) != FALSE,
+                        // SAFETY: the store and issuer context are live; no
+                        // returned context is requested.
+                        unsafe {
+                            CertAddCertificateContextToStore(
+                                export_store.0,
+                                context.0,
+                                CERT_STORE_ADD_ALWAYS,
+                                ptr::null_mut(),
+                            )
+                        } != FALSE,
                         (),
                         "Add PFX issuer certificate",
                     )?;
@@ -1078,26 +1157,34 @@ fn execute(mut options: Options) -> Result<(), String> {
                 let encoded = (|| {
                     let mut blob = CRYPT_DATA_BLOB::default();
                     api(
-                        PFXExportCertStoreEx(
-                            export_store.0,
-                            &mut blob,
-                            wide_secret.as_ptr(),
-                            ptr::null_mut(),
-                            EXPORT_PRIVATE_KEYS,
-                        ) != FALSE,
+                        // SAFETY: the store, output blob, and terminated
+                        // password are live; a null output buffer requests size.
+                        unsafe {
+                            PFXExportCertStoreEx(
+                                export_store.0,
+                                &mut blob,
+                                wide_secret.as_ptr(),
+                                ptr::null_mut(),
+                                EXPORT_PRIVATE_KEYS,
+                            )
+                        } != FALSE,
                         (),
                         "Size PFX export",
                     )?;
                     let mut encoded = vec![0u8; blob.cbData as usize];
                     blob.pbData = encoded.as_mut_ptr();
                     api(
-                        PFXExportCertStoreEx(
-                            export_store.0,
-                            &mut blob,
-                            wide_secret.as_ptr(),
-                            ptr::null_mut(),
-                            EXPORT_PRIVATE_KEYS,
-                        ) != FALSE,
+                        // SAFETY: the blob now describes the writable
+                        // `encoded` buffer and the other inputs remain live.
+                        unsafe {
+                            PFXExportCertStoreEx(
+                                export_store.0,
+                                &mut blob,
+                                wide_secret.as_ptr(),
+                                ptr::null_mut(),
+                                EXPORT_PRIVATE_KEYS,
+                            )
+                        } != FALSE,
                         (),
                         "Export PFX",
                     )?;
@@ -1140,50 +1227,60 @@ fn execute(mut options: Options) -> Result<(), String> {
                         }
                         output
                     } else {
-                        let memory = Store(CertOpenStore(
-                            PROVIDER_MEMORY as LPCSTR,
-                            0,
-                            0,
-                            0,
-                            ptr::null(),
-                        ));
+                        // SAFETY: the memory provider accepts a null provider
+                        // parameter.
+                        let memory = Store(unsafe {
+                            CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null())
+                        });
                         api(!memory.0.is_null(), (), "Create export store")?;
                         for index in &selected {
                             api(
-                                CertAddCertificateContextToStore(
-                                    memory.0,
-                                    contents[*index].context.0,
-                                    CERT_STORE_ADD_ALWAYS,
-                                    ptr::null_mut(),
-                                ) != FALSE,
+                                // SAFETY: the store and selected context are
+                                // live; no returned context is requested.
+                                unsafe {
+                                    CertAddCertificateContextToStore(
+                                        memory.0,
+                                        contents[*index].context.0,
+                                        CERT_STORE_ADD_ALWAYS,
+                                        ptr::null_mut(),
+                                    )
+                                } != FALSE,
                                 (),
                                 "Build export store",
                             )?;
                         }
                         let mut blob = CRYPT_DATA_BLOB::default();
                         api(
-                            CertSaveStore(
-                                memory.0,
-                                PKCS_7_ASN_ENCODING,
-                                CERT_STORE_SAVE_AS_PKCS7,
-                                CERT_STORE_SAVE_TO_MEMORY,
-                                (&mut blob as *mut CRYPT_DATA_BLOB).cast(),
-                                0,
-                            ) != FALSE,
+                            // SAFETY: the store and writable blob are live;
+                            // null blob data requests the output size.
+                            unsafe {
+                                CertSaveStore(
+                                    memory.0,
+                                    PKCS_7_ASN_ENCODING,
+                                    CERT_STORE_SAVE_AS_PKCS7,
+                                    CERT_STORE_SAVE_TO_MEMORY,
+                                    (&mut blob as *mut CRYPT_DATA_BLOB).cast(),
+                                    0,
+                                )
+                            } != FALSE,
                             (),
                             "Size PKCS#7",
                         )?;
                         let mut output = vec![0u8; blob.cbData as usize];
                         blob.pbData = output.as_mut_ptr();
                         api(
-                            CertSaveStore(
-                                memory.0,
-                                PKCS_7_ASN_ENCODING,
-                                CERT_STORE_SAVE_AS_PKCS7,
-                                CERT_STORE_SAVE_TO_MEMORY,
-                                (&mut blob as *mut CRYPT_DATA_BLOB).cast(),
-                                0,
-                            ) != FALSE,
+                            // SAFETY: the blob describes the writable `output`
+                            // buffer and the store remains live.
+                            unsafe {
+                                CertSaveStore(
+                                    memory.0,
+                                    PKCS_7_ASN_ENCODING,
+                                    CERT_STORE_SAVE_AS_PKCS7,
+                                    CERT_STORE_SAVE_TO_MEMORY,
+                                    (&mut blob as *mut CRYPT_DATA_BLOB).cast(),
+                                    0,
+                                )
+                            } != FALSE,
                             (),
                             "Export PKCS#7",
                         )?;
