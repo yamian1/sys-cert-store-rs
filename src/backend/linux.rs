@@ -2733,8 +2733,8 @@ pub unsafe fn SysCertPopulateDotNetCrlCache(user_name: LPCSTR) -> BOOL {
         } else {
             Some(unsafe { CStr::from_ptr(user_name) })
         };
-        let state = STATE.lock();
-        crl_cache::populate(user_name, &state.paths)?;
+        let paths = STATE.lock().paths.clone();
+        crl_cache::populate(user_name, &paths)?;
         Ok(TRUE)
     })
 }
@@ -2815,6 +2815,9 @@ pub unsafe fn CertEnumSystemStoreLocation(
 ///
 /// Location data, `argument`, and callback state must remain valid for the
 /// synchronous call. The callback must obey its API contract.
+///
+/// Store names are snapshotted before the first callback. Changes made by a
+/// callback are visible to later enumeration calls, not the current call.
 pub unsafe fn CertEnumSystemStore(
     flags: DWORD,
     location_parameter: *mut c_void,
@@ -2834,11 +2837,11 @@ pub unsafe fn CertEnumSystemStore(
         )?;
         let callback = callback
             .ok_or_else(|| ApiError::new(E_INVALIDARG, "Missing store enumeration callback"))?;
-        let state = STATE.lock();
+        let paths = STATE.lock().paths.clone();
         let directory = if flags == CERT_SYSTEM_STORE_CURRENT_USER {
-            user_data_directory(&state.paths)?
+            user_data_directory(&paths)?
         } else {
-            state.paths.machine.clone()
+            paths.machine
         };
         let mut names = BTreeSet::from(["CA".to_owned(), "MY".to_owned(), "ROOT".to_owned()]);
         if directory.exists() {

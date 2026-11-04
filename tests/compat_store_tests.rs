@@ -18,9 +18,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sys_cert_store::api_types::*;
 use sys_cert_store::*;
 use tempfile::TempDir;
@@ -348,6 +348,23 @@ fn verify_base_policy(chain: *const CERT_CHAIN_CONTEXT) -> CERT_CHAIN_POLICY_STA
 fn free_chain(chain: *const CERT_CHAIN_CONTEXT) {
     // SAFETY: each helper caller transfers one live chain exactly once.
     unsafe { CertFreeCertificateChain(chain) };
+}
+
+unsafe extern "system" fn open_store_during_enumeration(
+    _: *const std::ffi::c_void,
+    _: DWORD,
+    _: *const CERT_SYSTEM_STORE_INFO,
+    _: *const std::ffi::c_void,
+    argument: *mut std::ffi::c_void,
+) -> BOOL {
+    // SAFETY: the test passes a live `usize` as the callback argument.
+    unsafe { *argument.cast::<usize>() += 1 };
+    // SAFETY: the memory provider accepts a null provider parameter.
+    let store = unsafe { CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null()) };
+    if store.is_null() {
+        return FALSE;
+    }
+    CertCloseStore(store, 0)
 }
 
 #[test]
@@ -1177,6 +1194,18 @@ fn threading_and_system_scope() {
     // SAFETY: the configuration and its C strings remain live while stores
     // use it.
     assert_ok(unsafe { SysCertConfigureSystemStores(&configuration) });
+    let mut enumerated = 0_usize;
+    // SAFETY: the callback and its counter remain live for the synchronous
+    // enumeration call.
+    assert_ok(unsafe {
+        CertEnumSystemStore(
+            CERT_SYSTEM_STORE_CURRENT_USER,
+            ptr::null_mut(),
+            (&mut enumerated as *mut usize).cast(),
+            Some(open_store_during_enumeration),
+        )
+    });
+    assert!(enumerated >= 3);
     {
         let user_my = Store::scoped("MY", CERT_SYSTEM_STORE_CURRENT_USER, 0);
         let machine_my = Store::scoped("MY", CERT_SYSTEM_STORE_LOCAL_MACHINE, 0);
@@ -1269,10 +1298,14 @@ fn dotnet_crl_cache_regression() {
     );
     let crl = generate_crl(temp.path(), &issuer, &issuer_key);
     let body = crl.clone();
+    let (request_started_tx, request_started_rx) = mpsc::channel();
+    let (send_response_tx, send_response_rx) = mpsc::channel();
     let server = thread::spawn(move || {
         let (mut client, _) = listener.accept().unwrap();
         let mut request = [0u8; 4096];
         let _ = client.read(&mut request).unwrap();
+        request_started_tx.send(()).unwrap();
+        send_response_rx.recv().unwrap();
         write!(
             client,
             "HTTP/1.0 200 OK\r\nContent-Type: application/pkix-crl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1319,8 +1352,32 @@ fn dotnet_crl_cache_regression() {
     assert!(!account.is_null());
     // SAFETY: `account` is live and `pw_name` is a terminated C string owned
     // by the process password database.
-    assert_ok(unsafe { SysCertPopulateDotNetCrlCache((*account).pw_name) });
+    let account_name = unsafe { CStr::from_ptr((*account).pw_name) }.to_owned();
+    let populate = thread::spawn(move || {
+        // SAFETY: `account_name` remains live for the synchronous call.
+        unsafe { SysCertPopulateDotNetCrlCache(account_name.as_ptr()) }
+    });
+    request_started_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("CRL download did not start");
+    let (store_result_tx, store_result_rx) = mpsc::channel();
+    let store_operation = thread::spawn(move || {
+        // SAFETY: the memory provider accepts a null provider parameter.
+        let store = unsafe { CertOpenStore(PROVIDER_MEMORY as LPCSTR, 0, 0, 0, ptr::null()) };
+        let result = !store.is_null() && CertCloseStore(store, 0) != FALSE;
+        store_result_tx.send(result).unwrap();
+    });
+    let store_available_during_download = store_result_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or(false);
+    send_response_tx.send(()).unwrap();
+    assert_ok(populate.join().unwrap());
     server.join().unwrap();
+    store_operation.join().unwrap();
+    assert!(
+        store_available_during_download,
+        "CRL population held the global state lock during network I/O"
+    );
     unsafe {
         match previous_home {
             Some(value) => std::env::set_var("HOME", value),
