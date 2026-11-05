@@ -335,7 +335,7 @@ pub fn user_data_directory(paths: &SystemPaths) -> Result<PathBuf, ApiError> {
     let uid = unsafe { libc::geteuid() };
     let mut result = std::ptr::null_mut();
     let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buffer = vec![0i8; 16384];
+    let mut buffer = vec![libc::c_char::default(); 16384];
     require(
         unsafe {
             libc::getpwuid_r(

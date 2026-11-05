@@ -588,7 +588,7 @@ fn pfx_import_and_private_material() {
         )
     };
     assert!(name_size > 1);
-    let mut name = vec![0i8; name_size as usize];
+    let mut name = vec![libc::c_char::default(); name_size as usize];
     assert_eq!(
         // SAFETY: the context is live and `name` is writable for `name_size`
         // elements.

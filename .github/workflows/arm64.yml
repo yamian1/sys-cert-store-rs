@@ -1,0 +1,73 @@
+name: ARM64
+
+on:
+  push:
+    branches:
+      - main
+      - r04-arm64-validation
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential \
+            cmake \
+            libssl-dev \
+            ninja-build \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --component clippy,rustfmt
+          rustup default stable
+
+      - name: Verify native ARM64 host
+        run: |
+          test "$(uname -m)" = "aarch64"
+          rustc --version --verbose
+
+      - name: Validate direct Cargo build
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+          cargo test --doc
+
+      - name: Configure bundled crypto
+        run: >
+          cmake -S . -B build-arm64 -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+
+      - name: Build bundled crypto
+        run: cmake --build build-arm64 --parallel 4
+
+      - name: Verify ARM64 executable
+        run: |
+          file build-arm64/cargo-target/release/certutil
+          readelf -h build-arm64/cargo-target/release/certutil |
+            grep --fixed-strings "Machine:" |
+            grep --fixed-strings "AArch64"
+
+      - name: Test bundled crypto
+        run: ctest --test-dir build-arm64 --output-on-failure

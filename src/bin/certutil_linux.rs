@@ -394,7 +394,7 @@ fn certificate_name(context: *const CERT_CONTEXT, issuer: bool) -> Result<String
         )
     };
     api(size != 0, (), "Size certificate name")?;
-    let mut output = vec![0i8; size as usize];
+    let mut output = vec![libc::c_char::default(); size as usize];
     api(
         // SAFETY: `context` is live and `output` is writable for `size`
         // elements.
@@ -434,7 +434,7 @@ fn certificate_pem(certificate: &NativeCertificate) -> Result<Vec<u8>, String> {
         (),
         "Size certificate PEM",
     )?;
-    let mut output = vec![0i8; size as usize];
+    let mut output = vec![0u8; size as usize];
     api(
         // SAFETY: `der` is readable and `output` is writable for the size
         // returned by the preceding call.
@@ -443,18 +443,15 @@ fn certificate_pem(certificate: &NativeCertificate) -> Result<Vec<u8>, String> {
                 der.as_ptr(),
                 der.len() as DWORD,
                 CRYPT_STRING_BASE64HEADER,
-                output.as_mut_ptr(),
+                output.as_mut_ptr().cast(),
                 &mut size,
             )
         } != FALSE,
         (),
         "Encode certificate PEM",
     )?;
-    Ok(output
-        .into_iter()
-        .take(size.saturating_sub(1) as usize)
-        .map(|value| value as u8)
-        .collect())
+    output.truncate(size.saturating_sub(1) as usize);
+    Ok(output)
 }
 
 fn show(
