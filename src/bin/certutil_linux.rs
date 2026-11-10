@@ -7,7 +7,7 @@ use std::ptr;
 use sys_cert_store::api_types::*;
 use sys_cert_store::cert::Certificate as NativeCertificate;
 use sys_cert_store::*;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const HELP: &str = r#"sys-cert-store certutil (Linux; not NSS certutil)
 Usage: certutil [options] command [arguments]
@@ -48,7 +48,7 @@ struct Options {
     native_write: bool,
     help: bool,
     format: Option<String>,
-    password: Option<String>,
+    password: Option<Zeroizing<String>>,
     password_file: Option<PathBuf>,
     user_directory: Option<CString>,
     machine_directory: Option<CString>,
@@ -71,7 +71,7 @@ fn lower(value: &str) -> String {
 }
 
 fn parse_options() -> Result<Options, Usage> {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let arguments = Zeroizing::new(std::env::args().skip(1).collect::<Vec<_>>());
     let mut result = Options {
         scope: CERT_SYSTEM_STORE_LOCAL_MACHINE,
         ..Options::default()
@@ -127,7 +127,7 @@ fn parse_options() -> Result<Options, Usage> {
                 result.password.is_none() && result.password_file.is_none(),
                 "Specify one password source",
             )?;
-            result.password = Some(value()?);
+            result.password = Some(Zeroizing::new(value()?));
         } else if name == "--password-file" {
             usage(
                 result.password.is_none() && result.password_file.is_none(),
@@ -224,7 +224,11 @@ fn parse_options() -> Result<Options, Usage> {
         "Computer ROOT changes require --allow-native-write (and OS permission)",
     )?;
     usage(
-        !(result.command == "-exportpfx" && result.password.as_deref() == Some("")),
+        !(result.command == "-exportpfx"
+            && result
+                .password
+                .as_ref()
+                .is_some_and(|value| value.is_empty())),
         "PFX export requires a nonempty password",
     )?;
     Ok(result)
@@ -702,6 +706,7 @@ fn write_file(path: &Path, data: &[u8], force: bool) -> Result<(), String> {
         std::process::id(),
         rand::random::<u64>()
     ));
+    let mut pending = PendingOutput::new(temporary.clone());
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -717,15 +722,38 @@ fn write_file(path: &Path, data: &[u8], force: bool) -> Result<(), String> {
         fs::hard_link(&temporary, path).map_err(|error| error.to_string())?;
         fs::remove_file(&temporary).map_err(|error| error.to_string())?;
     }
+    pending.commit();
     Ok(())
 }
 
-fn password(options: &Options, exporting: bool) -> Result<String, String> {
+struct PendingOutput {
+    path: Option<PathBuf>,
+}
+
+impl PendingOutput {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn commit(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn password(options: &Options, exporting: bool) -> Result<Zeroizing<String>, String> {
     let value = if let Some(value) = &options.password {
         eprintln!(
             "CertUtil: warning: -p passwords are visible in process arguments; prefer --password-file or a terminal prompt."
         );
-        value.clone()
+        Zeroizing::new(value.as_str().to_owned())
     } else if let Some(path) = &options.password_file {
         let metadata = fs::symlink_metadata(path).map_err(|_| "Cannot open password file")?;
         if !metadata.is_file()
@@ -738,8 +766,12 @@ fn password(options: &Options, exporting: bool) -> Result<String, String> {
                 "Password file must be private, owned by this user, and at most 4096 bytes".into(),
             );
         }
-        let mut value = String::from_utf8(fs::read(path).map_err(|_| "Cannot read password file")?)
-            .map_err(|_| "Password is not valid UTF-8")?;
+        let bytes = Zeroizing::new(fs::read(path).map_err(|_| "Cannot read password file")?);
+        let mut value = Zeroizing::new(
+            std::str::from_utf8(&bytes)
+                .map_err(|_| "Password is not valid UTF-8")?
+                .to_owned(),
+        );
         if value.ends_with('\n') {
             value.pop();
             if value.ends_with('\r') {
@@ -755,11 +787,14 @@ fn password(options: &Options, exporting: bool) -> Result<String, String> {
         std::io::stderr()
             .flush()
             .map_err(|error| error.to_string())?;
-        let mut value = String::new();
+        let mut value = Zeroizing::new(String::new());
         std::io::stdin()
             .read_line(&mut value)
             .map_err(|error| error.to_string())?;
-        value.trim_end_matches(['\r', '\n']).to_owned()
+        while value.ends_with(['\r', '\n']) {
+            value.pop();
+        }
+        value
     };
     if value.contains('\0') {
         return Err("Password must not contain NUL bytes".into());
@@ -1005,9 +1040,9 @@ fn execute(mut options: Options) -> Result<(), String> {
             {
                 return Err("Computer ROOT does not store private keys; use -addstore for public trust anchors".into());
             }
-            let mut secret = password(&options, false)?;
-            let wide_secret = wide(&secret);
-            let mut input = read_file(Path::new(options.args.last().unwrap()))?;
+            let secret = password(&options, false)?;
+            let wide_secret = Zeroizing::new(wide(&secret));
+            let mut input = Zeroizing::new(read_file(Path::new(options.args.last().unwrap()))?);
             let blob = CRYPT_DATA_BLOB {
                 cbData: input.len() as DWORD,
                 pbData: input.as_mut_ptr(),
@@ -1026,7 +1061,6 @@ fn execute(mut options: Options) -> Result<(), String> {
                 (),
                 "Import PFX",
             )?;
-            secret.zeroize();
             println!("PFX imported into {name}.");
         }
         _ => {
@@ -1149,8 +1183,8 @@ fn execute(mut options: Options) -> Result<(), String> {
                         "Add PFX issuer certificate",
                     )?;
                 }
-                let mut secret = password(&options, true)?;
-                let wide_secret = wide(&secret);
+                let secret = password(&options, true)?;
+                let wide_secret = Zeroizing::new(wide(&secret));
                 let encoded = (|| {
                     let mut blob = CRYPT_DATA_BLOB::default();
                     api(
@@ -1168,7 +1202,7 @@ fn execute(mut options: Options) -> Result<(), String> {
                         (),
                         "Size PFX export",
                     )?;
-                    let mut encoded = vec![0u8; blob.cbData as usize];
+                    let mut encoded = Zeroizing::new(vec![0u8; blob.cbData as usize]);
                     blob.pbData = encoded.as_mut_ptr();
                     api(
                         // SAFETY: the blob now describes the writable
@@ -1187,14 +1221,12 @@ fn execute(mut options: Options) -> Result<(), String> {
                     )?;
                     Ok::<_, String>(encoded)
                 })();
-                secret.zeroize();
                 let encoded = encoded?;
                 write_file(
                     Path::new(options.args.last().unwrap()),
                     &encoded,
                     options.force,
                 )?;
-                secret.zeroize();
                 println!(
                     "Encrypted PFX exported ({} certificates).",
                     1 + issuers.len()
@@ -1315,4 +1347,34 @@ pub fn run() {
         }
     };
     std::process::exit(status);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PendingOutput;
+    use std::fs;
+
+    #[test]
+    fn pending_output_removes_uncommitted_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".certutil-test");
+        fs::write(&path, b"sensitive").unwrap();
+
+        drop(PendingOutput::new(path.clone()));
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn pending_output_preserves_committed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".certutil-test");
+        fs::write(&path, b"complete").unwrap();
+        let mut pending = PendingOutput::new(path.clone());
+
+        pending.commit();
+        drop(pending);
+
+        assert_eq!(fs::read(path).unwrap(), b"complete");
+    }
 }

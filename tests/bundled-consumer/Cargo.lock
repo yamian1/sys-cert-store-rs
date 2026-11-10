@@ -838,8 +838,6 @@ dependencies = [
 [[package]]
 name = "p12-keystore"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59710c89ee68e5cd17e8bac17a18e0a674bf959b11317531f481e612f567283c"
 dependencies = [
  "cbc",
  "cms",
@@ -856,6 +854,7 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

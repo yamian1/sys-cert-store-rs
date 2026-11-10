@@ -1,0 +1,832 @@
+use cms::{
+    cert::x509::{
+        attr::{Attribute, AttributeValue, Attributes},
+        spki::AlgorithmIdentifierOwned,
+    },
+    content_info::{CmsVersion, ContentInfo},
+    encrypted_data::EncryptedData,
+    enveloped_data::EncryptedContentInfo,
+};
+use der::{
+    Any, Decode, Encode, Sequence,
+    asn1::{BmpString, ContextSpecific, ObjectIdentifier, OctetString, OctetStringRef, SetOfVec},
+};
+use hmac::{KeyInit, Mac};
+use pkcs5::pbes2;
+use pkcs12::{
+    CertBag, DigestInfo, MacData, kdf,
+    pbe_params::EncryptedPrivateKeyInfo,
+    safe_bag::{Pkcs8Version, PrivateKeyInfo, SafeBag, SafeContents},
+};
+use rand::random;
+use sha1::Sha1;
+use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
+use zeroize::Zeroizing;
+#[cfg(feature = "pbes1")]
+use {
+    crate::pbes1::{PbeMode, Pbes1},
+    der::{Reader, SliceReader, SliceWriter},
+};
+
+pub(crate) use crate::{
+    Result,
+    cert::Certificate,
+    error::Error,
+    keychain::{PrivateKey, PrivateKeyChain},
+    keystore::{EncryptionAlgorithm, MacAlgorithm},
+    oid,
+    secret::{Secret, SecretKeyType},
+};
+
+pub struct ParsedKeyChain {
+    pub friendly_name: Option<String>,
+    pub key: PrivateKeyChain,
+}
+
+pub struct ParsedSecret {
+    pub friendly_name: Option<String>,
+    pub key: Secret,
+}
+
+pub struct ParsedCertificate {
+    pub friendly_name: Option<String>,
+    pub local_key_id: Option<Vec<u8>>,
+    pub trusted: bool,
+    pub cert: Certificate,
+}
+
+pub struct ParsedAuthSafe {
+    pub keys: Vec<ParsedKeyChain>,
+    pub certs: Vec<ParsedCertificate>,
+    pub secrets: Vec<ParsedSecret>,
+}
+
+pub(crate) const MAX_MAC_ITERATIONS: i32 = 1_000_000;
+const MAX_KDF_ITERATIONS: i32 = 1_000_000;
+
+// Cap on scrypt effective memory cost (128 * N * r). 1 GiB.
+const MAX_SCRYPT_MEMORY_BYTES: u64 = 1 << 30;
+
+// Cap on scrypt parallelism p.
+const MAX_SCRYPT_PARALLELISM: u16 = 16;
+
+fn scrypt_within_limits(params: &pkcs5::pbes2::ScryptParams) -> bool {
+    if params.parallelization > MAX_SCRYPT_PARALLELISM {
+        return false;
+    }
+    match 128u64
+        .checked_mul(params.cost_parameter)
+        .and_then(|value| value.checked_mul(u64::from(params.block_size)))
+    {
+        Some(memory) => memory <= MAX_SCRYPT_MEMORY_BYTES,
+        None => false,
+    }
+}
+
+macro_rules! verify_traditional_mac {
+    ($digest:ty, $mac_data:expr, $password:expr, $data:expr) => {{
+        let mac_data = $mac_data;
+        let key = Zeroizing::new(kdf::derive_key_utf8::<$digest>(
+            $password,
+            mac_data.mac_salt.as_bytes(),
+            kdf::Pkcs12KeyType::Mac,
+            mac_data.iterations,
+            <$digest as hmac::digest::OutputSizeUser>::output_size(),
+        )?);
+        let mut mac = hmac::Hmac::<$digest>::new_from_slice(&key).map_err(|_| Error::InvalidLength)?;
+        mac.update($data);
+        mac.verify_slice(mac_data.mac.digest.as_bytes())?;
+        Ok(())
+    }};
+}
+
+macro_rules! compute_traditional_mac {
+    ($digest:ty, $data:expr, $iterations:expr, $password:expr) => {{
+        let salt: [u8; 8] = random();
+        let key = Zeroizing::new(kdf::derive_key_utf8::<$digest>(
+            $password,
+            &salt,
+            kdf::Pkcs12KeyType::Mac,
+            $iterations,
+            <$digest as hmac::digest::OutputSizeUser>::output_size(),
+        )?);
+        let mut mac = hmac::Hmac::<$digest>::new_from_slice(&key).map_err(|_| Error::InvalidLength)?;
+        mac.update($data);
+        (salt.to_vec(), mac.finalize().into_bytes().to_vec())
+    }};
+}
+
+pub fn verify_mac(mac_data: &MacData, password: &str, data: &[u8]) -> Result<()> {
+    if mac_data.iterations > MAX_MAC_ITERATIONS {
+        return Err(Error::InvalidParameters);
+    }
+
+    match mac_data.mac.algorithm.oid {
+        oid::SHA1_OID => verify_traditional_mac!(Sha1, mac_data, password, data),
+        oid::SHA224_OID => verify_traditional_mac!(Sha224, mac_data, password, data),
+        oid::SHA256_OID => verify_traditional_mac!(Sha256, mac_data, password, data),
+        oid::SHA384_OID => verify_traditional_mac!(Sha384, mac_data, password, data),
+        oid::SHA512_OID => verify_traditional_mac!(Sha512, mac_data, password, data),
+        oid::SHA512_224_OID => verify_traditional_mac!(Sha512_224, mac_data, password, data),
+        oid::SHA512_256_OID => verify_traditional_mac!(Sha512_256, mac_data, password, data),
+        _ => Err(Error::UnsupportedEncryptionScheme),
+    }
+}
+
+pub fn parse_auth_safe(safe: &ContentInfo, password: &str) -> Result<ParsedAuthSafe> {
+    let data = match safe.content_type {
+        oid::CONTENT_TYPE_DATA_OID => {
+            Zeroizing::new(OctetString::from_der(&safe.content.to_der()?)?.as_bytes().to_vec())
+        }
+        oid::CONTENT_TYPE_ENCRYPTED_DATA_OID => {
+            let enc_data = EncryptedData::from_der(&safe.content.to_der()?)?;
+            if enc_data.version != CmsVersion::V0 {
+                return Err(Error::InvalidVersion);
+            }
+            if let Some(data) = enc_data
+                .enc_content_info
+                .encrypted_content
+                .as_ref()
+                .map(|os| os.as_bytes())
+            {
+                decrypt(&enc_data.enc_content_info.content_enc_alg, data, password)?
+            } else {
+                Zeroizing::new(Vec::new())
+            }
+        }
+        _ => {
+            return Err(Error::UnsupportedContentType);
+        }
+    };
+
+    parse_bags(SafeContents::from_der(&data)?, password)
+}
+
+fn decrypt(alg: &AlgorithmIdentifierOwned, data: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>> {
+    match alg.oid {
+        oid::PBES2_OID => {
+            let params = alg.parameters.as_ref().ok_or(Error::InvalidParameters)?.to_der()?;
+
+            let params = pbes2::Parameters::from_der(&params)?;
+
+            match &params.kdf {
+                pbes2::Kdf::Pbkdf2(pbkdf2) if pbkdf2.iteration_count > MAX_KDF_ITERATIONS as u32 => {
+                    return Err(Error::InvalidParameters);
+                }
+                pbes2::Kdf::Scrypt(scrypt) if !scrypt_within_limits(scrypt) => {
+                    return Err(Error::InvalidParameters);
+                }
+                _ => {}
+            }
+
+            Ok(Zeroizing::new(
+                params
+                    .decrypt(password.as_bytes(), data)
+                    .map_err(|e| Error::Pkcs5Error(format!("{e}")))?,
+            ))
+        }
+        #[cfg(feature = "pbes1")]
+        oid::PBE_WITH_SHA_AND_40BIT_RC2_CBC_OID | oid::PBE_WITH_SHA_AND3_KEY_TRIPLE_DES_CBC_OID => {
+            let params = alg.parameters.as_ref().ok_or(Error::InvalidParameters)?.to_der()?;
+
+            let mut reader = SliceReader::new(&params)?;
+            let (salt, iterations) = reader.sequence(|reader| {
+                let salt = OctetString::decode(reader)?.as_bytes().to_vec();
+                let iterations: i32 = reader.decode()?;
+                Ok::<_, Error>((salt, iterations))
+            })?;
+
+            if iterations > MAX_KDF_ITERATIONS {
+                return Err(Error::InvalidParameters);
+            }
+
+            Pbes1::new(alg.oid, &salt, iterations, PbeMode::Decrypt)
+                .encrypt_decrypt(data, password)
+                .map(Zeroizing::new)
+        }
+        _ => Err(Error::UnsupportedEncryptionScheme),
+    }
+}
+
+fn encrypt(
+    alg: EncryptionAlgorithm,
+    iterations: i32,
+    data: &[u8],
+    password: &str,
+) -> Result<(AlgorithmIdentifierOwned, Vec<u8>)> {
+    match alg {
+        EncryptionAlgorithm::PbeWithHmacSha256AndAes256 => {
+            let salt: [u8; 32] = random();
+            let iv: [u8; 16] = random();
+            let params = pbes2::Parameters::generate_pbkdf2_sha256_aes256cbc(iterations as _, &salt, iv)
+                .map_err(|e| Error::Pkcs5Error(e.to_string()))?;
+
+            let encrypted = params
+                .encrypt(password.as_bytes(), data)
+                .map_err(|e| Error::Pkcs5Error(format!("{e}")))?;
+
+            let alg_id = AlgorithmIdentifierOwned {
+                oid: alg.to_oid(),
+                parameters: Some(Any::from_der(&params.to_der()?)?),
+            };
+
+            Ok((alg_id, encrypted))
+        }
+        #[cfg(feature = "pbes1")]
+        EncryptionAlgorithm::PbeWithShaAnd40BitRc4Cbc | EncryptionAlgorithm::PbeWithShaAnd3KeyTripleDesCbc => {
+            let salt: [u8; 20] = random();
+            let encrypted =
+                Pbes1::new(alg.to_oid(), &salt, iterations, PbeMode::Encrypt).encrypt_decrypt(data, password)?;
+
+            let mut buf = vec![0u8; 64];
+            let mut writer = SliceWriter::new(&mut buf);
+            let salt = OctetStringRef::new(&salt)?;
+
+            writer.sequence((salt.encoded_len()? + iterations.encoded_len()?)?, |writer| {
+                salt.encode(writer)?;
+                iterations.encode(writer)?;
+                Ok(())
+            })?;
+            let params = writer.finish()?;
+
+            let alg_id = AlgorithmIdentifierOwned {
+                oid: alg.to_oid(),
+                parameters: Some(Any::from_der(params)?),
+            };
+            Ok((alg_id, encrypted))
+        }
+        #[cfg(not(feature = "pbes1"))]
+        _ => Err(Error::UnsupportedEncryptionScheme),
+    }
+}
+
+fn get_bag_attribute(oid: &ObjectIdentifier, bag: &SafeBag) -> Option<Vec<u8>> {
+    if let Some(ref attrs) = bag.bag_attributes {
+        attrs.iter().find_map(|a| {
+            if a.oid == *oid {
+                a.values.iter().next().and_then(|a| a.to_der().ok())
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    }
+}
+
+fn parse_bags(bags: SafeContents, password: &str) -> Result<ParsedAuthSafe> {
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    let mut secrets = Vec::new();
+
+    for bag in bags {
+        let local_key_id = get_bag_attribute(&oid::LOCAL_KEY_ID_OID, &bag)
+            .and_then(|a| OctetString::from_der(&a).ok().map(|a| a.as_bytes().to_vec()));
+
+        let friendly_name = get_bag_attribute(&oid::FRIENDLY_NAME_OID, &bag)
+            .and_then(|n| BmpString::from_der(&n).ok().map(|a| a.to_string()));
+
+        let trusted = get_bag_attribute(&oid::ORACLE_TRUSTED_KEY_USAGE_OID, &bag)
+            .and_then(|n| ObjectIdentifier::from_der(&n).ok())
+            .map(|o| o == oid::ANY_EXTENDED_USAGE_OID)
+            .unwrap_or_default();
+
+        match bag.bag_id {
+            oid::PKCS_12_KEY_BAG_OID => {
+                let cs: ContextSpecific<PrivateKeyInfo> = ContextSpecific::from_der(&bag.bag_value)?;
+                if let Some(local_key_id) = local_key_id {
+                    let encoded = Zeroizing::new(cs.value.to_der()?);
+                    let key = PrivateKey::from_der(&encoded)?;
+                    let key = PrivateKeyChain {
+                        key,
+                        local_key_id: local_key_id.into(),
+                        certs: vec![],
+                    };
+                    keys.push(ParsedKeyChain { friendly_name, key });
+                }
+            }
+            oid::PKCS_12_CERT_BAG_OID => {
+                let cs: ContextSpecific<CertBag> = ContextSpecific::from_der(&bag.bag_value)?;
+                if cs.value.cert_id != oid::CERT_TYPE_X509_CERTIFICATE_OID {
+                    return Err(Error::UnsupportedCertificateType);
+                }
+                let cert = Certificate::from_der(cs.value.cert_value.as_bytes())?;
+                certs.push(ParsedCertificate {
+                    friendly_name,
+                    local_key_id,
+                    trusted,
+                    cert,
+                });
+            }
+            oid::PKCS_12_PKCS8_SHROUDED_KEY_BAG_OID => {
+                let cs: ContextSpecific<EncryptedPrivateKeyInfo> = ContextSpecific::from_der(&bag.bag_value)?;
+
+                let decrypted = decrypt(
+                    &cs.value.encryption_algorithm,
+                    cs.value.encrypted_data.as_bytes(),
+                    password,
+                )?;
+
+                if let Some(local_key_id) = local_key_id {
+                    let key = PrivateKeyChain {
+                        key: PrivateKey::from_der(&decrypted)?,
+                        local_key_id: local_key_id.into(),
+                        certs: vec![],
+                    };
+                    keys.push(ParsedKeyChain { friendly_name, key });
+                }
+            }
+            oid::PKCS_12_SECRET_BAG_OID => {
+                let secret_bag = SecretBag::from_bag_der(&bag.bag_value)?;
+
+                if let Ok(priv_key) = secret_bag.private_key_info(password) {
+                    if let Some(local_key_id) = local_key_id {
+                        let key = Secret {
+                            key_type: SecretKeyType::from_oid(&priv_key.algorithm.oid),
+                            key: Zeroizing::new(priv_key.private_key.into_bytes().into_vec()),
+                            local_key_id: local_key_id.into(),
+                        };
+                        secrets.push(ParsedSecret { friendly_name, key });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ParsedAuthSafe { keys, certs, secrets })
+}
+
+pub fn certificate_to_safe_bag(
+    certificate: &Certificate,
+    friendly_name: &str,
+    local_key_id: Option<&[u8]>,
+    trusted: bool,
+) -> Result<SafeBag> {
+    let mut bag_attributes = Attributes::new();
+
+    let friendly_name =
+        SetOfVec::<AttributeValue>::from_iter([Any::from_der(&BmpString::from_utf8(friendly_name)?.to_der()?)?])?;
+
+    bag_attributes.insert(Attribute {
+        oid: oid::FRIENDLY_NAME_OID,
+        values: friendly_name,
+    })?;
+
+    if let Some(local_key_id) = local_key_id {
+        let local_key_id =
+            SetOfVec::<AttributeValue>::from_iter([Any::from_der(&OctetStringRef::new(local_key_id)?.to_der()?)?])?;
+
+        bag_attributes.insert(Attribute {
+            oid: oid::LOCAL_KEY_ID_OID,
+            values: local_key_id,
+        })?;
+    }
+
+    if trusted {
+        let key_usage =
+            SetOfVec::<AttributeValue>::from_iter([Any::from_der(&oid::ANY_EXTENDED_USAGE_OID.to_der()?)?])?;
+
+        bag_attributes.insert(Attribute {
+            oid: oid::ORACLE_TRUSTED_KEY_USAGE_OID,
+            values: key_usage,
+        })?;
+    }
+
+    let cert_bag = CertBag {
+        cert_id: oid::CERT_TYPE_X509_CERTIFICATE_OID,
+        cert_value: OctetString::new(certificate.data.clone())?,
+    };
+    Ok(SafeBag {
+        bag_id: oid::PKCS_12_CERT_BAG_OID,
+        bag_value: cert_bag.to_der()?,
+        bag_attributes: Some(bag_attributes),
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Sequence)]
+pub struct SecretBag {
+    pub object_identifier: ObjectIdentifier,
+    #[asn1(context_specific = "0")]
+    pub encrypted_private_key_info: OctetString,
+    pub bag_attributes: Option<Attributes>,
+}
+
+impl SecretBag {
+    pub fn private_key_info(&self, password: &str) -> Result<PrivateKeyInfo> {
+        if let Ok(enc_key) =
+            pkcs12::pbe_params::EncryptedPrivateKeyInfo::from_der(self.encrypted_private_key_info.as_bytes())
+        {
+            if let Ok(plain) = decrypt(
+                &enc_key.encryption_algorithm,
+                enc_key.encrypted_data.as_bytes(),
+                password,
+            ) {
+                if let Ok(priv_key) = PrivateKeyInfo::from_der(&plain) {
+                    return Ok(priv_key);
+                }
+            }
+        }
+        Err(Error::UnsupportedEncryptionScheme)
+    }
+
+    pub fn from_bag_der(data: &[u8]) -> Result<SecretBag> {
+        let envelope = Any::from_der(data)?;
+        Ok(SecretBag::from_der(envelope.value())?)
+    }
+}
+
+pub fn secret_to_safe_bag(
+    key: &Secret,
+    algorithm: EncryptionAlgorithm,
+    friendly_name: &str,
+    iterations: i32,
+    password: &str,
+) -> Result<SafeBag> {
+    let mut bag_attributes = Attributes::new();
+    let friendly_name =
+        SetOfVec::<AttributeValue>::from_iter([Any::from_der(&BmpString::from_utf8(friendly_name)?.to_der()?)?])?;
+
+    bag_attributes.insert(Attribute {
+        oid: oid::FRIENDLY_NAME_OID,
+        values: friendly_name,
+    })?;
+
+    let local_key_id = SetOfVec::<AttributeValue>::from_iter([Any::from_der(
+        &OctetStringRef::new(key.local_key_id.as_ref())?.to_der()?,
+    )?])?;
+
+    bag_attributes.insert(Attribute {
+        oid: oid::LOCAL_KEY_ID_OID,
+        values: local_key_id,
+    })?;
+
+    let key_algorithm_identifier = AlgorithmIdentifierOwned {
+        oid: key.key_type.to_oid(),
+        parameters: None,
+    };
+
+    let key_info = PrivateKeyInfo {
+        version: Pkcs8Version::V0,
+        algorithm: key_algorithm_identifier,
+        private_key: OctetString::new(key.key.as_slice())?,
+        attributes: None,
+    };
+
+    let key_info_der = Zeroizing::new(key_info.to_der()?);
+
+    let (alg_id, encrypted) = encrypt(algorithm, iterations, &key_info_der, password)?;
+
+    let encrypted_key_info = EncryptedPrivateKeyInfo {
+        encryption_algorithm: alg_id,
+        encrypted_data: OctetString::new(encrypted)?,
+    };
+
+    let encrypted_key_info_os = OctetString::new(encrypted_key_info.to_der()?)?;
+
+    let secret_bag = SecretBag {
+        object_identifier: oid::PKCS_12_PKCS8_SHROUDED_KEY_BAG_OID,
+        encrypted_private_key_info: encrypted_key_info_os,
+        bag_attributes: None,
+    };
+
+    let any = Any::from_der(&secret_bag.to_der()?)?;
+
+    Ok(SafeBag {
+        bag_id: oid::PKCS_12_SECRET_BAG_OID,
+        bag_value: any.to_der()?,
+        bag_attributes: Some(bag_attributes),
+    })
+}
+
+pub fn private_key_to_safe_bag(
+    key: &PrivateKeyChain,
+    friendly_name: &str,
+    algorithm: EncryptionAlgorithm,
+    iterations: i32,
+    password: &str,
+) -> Result<SafeBag> {
+    let mut bag_attributes = Attributes::new();
+
+    let friendly_name =
+        SetOfVec::<AttributeValue>::from_iter([Any::from_der(&BmpString::from_utf8(friendly_name)?.to_der()?)?])?;
+
+    bag_attributes.insert(Attribute {
+        oid: oid::FRIENDLY_NAME_OID,
+        values: friendly_name,
+    })?;
+
+    let local_key_id = SetOfVec::<AttributeValue>::from_iter([Any::from_der(
+        &OctetStringRef::new(key.local_key_id.as_ref())?.to_der()?,
+    )?])?;
+
+    bag_attributes.insert(Attribute {
+        oid: oid::LOCAL_KEY_ID_OID,
+        values: local_key_id,
+    })?;
+
+    let (alg_id, encrypted) = encrypt(algorithm, iterations, key.key().as_der(), password)?;
+
+    let pk_info = EncryptedPrivateKeyInfo {
+        encryption_algorithm: alg_id,
+        encrypted_data: OctetString::new(encrypted)?,
+    }
+    .to_der()?;
+
+    Ok(SafeBag {
+        bag_id: oid::PKCS_12_PKCS8_SHROUDED_KEY_BAG_OID,
+        bag_value: pk_info,
+        bag_attributes: Some(bag_attributes),
+    })
+}
+
+pub fn cert_bags_to_auth_safe(
+    bags: Vec<SafeBag>,
+    algorithm: EncryptionAlgorithm,
+    iterations: i32,
+    password: &str,
+) -> Result<ContentInfo> {
+    let data = bags.to_der()?;
+    let (alg_id, encrypted) = encrypt(algorithm, iterations, &data, password)?;
+
+    let encrypted_data = EncryptedData {
+        version: CmsVersion::V0,
+        enc_content_info: EncryptedContentInfo {
+            content_type: oid::CONTENT_TYPE_DATA_OID,
+            content_enc_alg: alg_id,
+            encrypted_content: Some(OctetString::new(encrypted)?),
+        },
+        unprotected_attrs: None,
+    };
+
+    Ok(ContentInfo {
+        content_type: oid::CONTENT_TYPE_ENCRYPTED_DATA_OID,
+        content: Any::from_der(&encrypted_data.to_der()?)?,
+    })
+}
+
+pub fn key_bags_to_auth_safe(bags: Vec<SafeBag>) -> Result<ContentInfo> {
+    Ok(ContentInfo {
+        content_type: oid::CONTENT_TYPE_DATA_OID,
+        content: Any::from_der(&OctetString::new(bags.to_der()?)?.to_der()?)?,
+    })
+}
+
+pub fn compute_mac(data: &[u8], algorithm: MacAlgorithm, iterations: i32, password: &str) -> Result<MacData> {
+    let (oid, salt, digest) = match algorithm {
+        MacAlgorithm::HmacSha1 => {
+            let (salt, digest) = compute_traditional_mac!(Sha1, data, iterations, password);
+            (oid::SHA1_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha224 => {
+            let (salt, digest) = compute_traditional_mac!(Sha224, data, iterations, password);
+            (oid::SHA224_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha256 => {
+            let (salt, digest) = compute_traditional_mac!(Sha256, data, iterations, password);
+            (oid::SHA256_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha384 => {
+            let (salt, digest) = compute_traditional_mac!(Sha384, data, iterations, password);
+            (oid::SHA384_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha512 => {
+            let (salt, digest) = compute_traditional_mac!(Sha512, data, iterations, password);
+            (oid::SHA512_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha512_224 => {
+            let (salt, digest) = compute_traditional_mac!(Sha512_224, data, iterations, password);
+            (oid::SHA512_224_OID, salt, digest)
+        }
+        MacAlgorithm::HmacSha512_256 => {
+            let (salt, digest) = compute_traditional_mac!(Sha512_256, data, iterations, password);
+            (oid::SHA512_256_OID, salt, digest)
+        }
+    };
+
+    Ok(MacData {
+        mac: DigestInfo {
+            algorithm: AlgorithmIdentifierOwned { oid, parameters: None },
+            digest: OctetString::new(digest)?,
+        },
+        mac_salt: OctetString::new(salt)?,
+        iterations: iterations as _,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use der::{Any, Decode, Encode};
+    use pkcs12::safe_bag::SafeBag;
+
+    use crate::{
+        EncryptionAlgorithm, MacAlgorithm,
+        codec::{SecretBag, compute_mac, secret_to_safe_bag, verify_mac},
+        error::Error,
+        oid::BLOWFISH_KEY_OID,
+        secret::{Secret, SecretKeyType::Aes},
+    };
+
+    // Testdata for writing the full SecretBag struct
+    const SECRET_BAG_DATA: &str = "oIGzMIGwBgsqhkiG9w0BDAoBAqCBoASBnTCBmjBmBgkqhkiG9w0BBQ0wWTA4BgkqhkiG9w0BBQwwKwQUnuKEvUWqBU1bJE7g5hYeIU3zsmYCAicQAgEgMAwGCCqGSIb3DQIJBQAwHQYJYIZIAWUDBAEqBBBEitwx8ZcwYypT521bjuv8BDAARNFyg3PJsKUGvngARYN+vtsXHVXEXLOlghj4awwBVf2BW1hZx5Zow+7CF6b/YE4=";
+    const TEST_STORE_PASSWORD: &str = "changeit";
+
+    #[test]
+    fn test_deserialize_bag() {
+        let der = STANDARD.decode(SECRET_BAG_DATA).unwrap();
+        let top = Any::from_der(&der).unwrap();
+
+        let inner = top.value();
+
+        match SecretBag::from_der(inner) {
+            Err(e) => panic!("{}", e),
+            Ok(bag) => {
+                let inner = bag.encrypted_private_key_info.as_bytes();
+                assert_eq!(inner.len(), 157);
+
+                let priv_key = bag.private_key_info(TEST_STORE_PASSWORD).unwrap();
+                assert_eq!(BLOWFISH_KEY_OID, priv_key.algorithm.oid);
+            }
+        };
+    }
+
+    #[test]
+    fn test_from_secret_bag() {
+        let key = [179, 90, 152, 194, 13, 90, 101, 100, 154, 17, 70, 109, 1, 234, 8, 16];
+        let der = STANDARD.decode(SECRET_BAG_DATA).unwrap();
+        let secret = SecretBag::from_bag_der(der.as_slice());
+        assert!(secret.is_ok());
+        if let Ok(secret) = secret {
+            let private_key_info = secret.private_key_info(TEST_STORE_PASSWORD);
+            match private_key_info {
+                Ok(priv_key_info) => {
+                    assert_eq!(BLOWFISH_KEY_OID, priv_key_info.algorithm.oid);
+                    assert_eq!(key, priv_key_info.private_key.as_bytes());
+                }
+                Err(e) => {
+                    panic!("PrivateKey not readable: {e:}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_secret_to_safe_bag() {
+        let secret = Secret::builder(Aes).with_length(32).build().unwrap();
+        let bag = secret_to_safe_bag(
+            &secret,
+            EncryptionAlgorithm::PbeWithHmacSha256AndAes256,
+            "myKey",
+            10000,
+            TEST_STORE_PASSWORD,
+        )
+        .unwrap();
+
+        let der = bag.to_der().unwrap();
+
+        let safe_bag = SafeBag::from_der(&der).unwrap();
+        let bag = SecretBag::from_bag_der(&safe_bag.bag_value).unwrap();
+
+        let private_key_info = bag.private_key_info(TEST_STORE_PASSWORD).unwrap();
+
+        let private_key_value = private_key_info.private_key.as_bytes();
+        assert_eq!(secret.key(), private_key_value);
+        assert_eq!(secret.key().len(), private_key_value.len());
+    }
+
+    #[test]
+    fn traditional_mac_round_trip_sha2_variants() {
+        let data = b"authenticated safe";
+        let password = TEST_STORE_PASSWORD;
+        for algorithm in [
+            MacAlgorithm::HmacSha1,
+            MacAlgorithm::HmacSha224,
+            MacAlgorithm::HmacSha256,
+            MacAlgorithm::HmacSha384,
+            MacAlgorithm::HmacSha512,
+            MacAlgorithm::HmacSha512_224,
+            MacAlgorithm::HmacSha512_256,
+        ] {
+            let mac = compute_mac(data, algorithm, 2048, password).expect("compute MAC");
+            verify_mac(&mac, password, data).expect("verify MAC");
+        }
+    }
+
+    #[test]
+    fn verify_mac_rejects_iterations_above_maximum_before_kdf() {
+        let data = b"authenticated safe";
+        let mut mac = compute_mac(data, MacAlgorithm::HmacSha256, 1, TEST_STORE_PASSWORD).unwrap();
+        mac.iterations = super::MAX_MAC_ITERATIONS + 1;
+
+        let result = verify_mac(&mac, TEST_STORE_PASSWORD, data);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_pbkdf2_iterations_above_maximum_before_kdf() {
+        let salt = [0x5au8; 32];
+        let iv = [0xa5u8; 16];
+        let mut params = pkcs5::pbes2::Parameters::generate_pbkdf2_sha256_aes256cbc(1000, &salt, iv).unwrap();
+        match &mut params.kdf {
+            pkcs5::pbes2::Kdf::Pbkdf2(pbkdf2) => {
+                pbkdf2.iteration_count = super::MAX_KDF_ITERATIONS as u32 + 1;
+            }
+            _ => unreachable!("builder always produces PBKDF2"),
+        }
+        let alg_id = super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBES2_OID,
+            parameters: Some(Any::from_der(&params.to_der().unwrap()).unwrap()),
+        };
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    // Builds a PBES2/scrypt AlgorithmIdentifier, letting the caller tamper
+    // with the decoded scrypt parameters before re-encoding.
+    fn scrypt_alg_id(tamper: impl FnOnce(&mut pkcs5::pbes2::ScryptParams)) -> super::AlgorithmIdentifierOwned {
+        let salt = [0x5au8; 32];
+        let iv = [0xa5u8; 16];
+        let scrypt_params = pkcs5::scrypt::Params::new(4, 8, 1).unwrap();
+        let mut params = pkcs5::pbes2::Parameters::generate_scrypt_aes256cbc(scrypt_params, &salt, iv).unwrap();
+        match &mut params.kdf {
+            pkcs5::pbes2::Kdf::Scrypt(scrypt) => tamper(scrypt),
+            _ => unreachable!("builder always produces scrypt"),
+        }
+        super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBES2_OID,
+            parameters: Some(Any::from_der(&params.to_der().unwrap()).unwrap()),
+        }
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_memory_cost_from_large_n_before_kdf() {
+        // r = 8 (from the builder), so N alone pushes 128 * N * r past 1 GiB.
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.cost_parameter = (super::MAX_SCRYPT_MEMORY_BYTES / (128 * 8)) + 1;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_memory_cost_from_large_block_size_before_kdf() {
+        // N within any sane bound, but a huge r blows the 128 * N * r budget —
+        // the case a cost-parameter-only guard misses.
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.cost_parameter = 1 << 14;
+            scrypt.block_size = u16::MAX;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[test]
+    fn decrypt_rejects_pbes2_scrypt_excessive_parallelism_before_kdf() {
+        let alg_id = scrypt_alg_id(|scrypt| {
+            scrypt.parallelization = super::MAX_SCRYPT_PARALLELISM + 1;
+        });
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+
+    #[cfg(feature = "pbes1")]
+    #[test]
+    fn decrypt_rejects_pbes1_iterations_above_maximum_before_kdf() {
+        use der::{SliceWriter, asn1::OctetStringRef};
+
+        let salt = [0x5au8; 20];
+        let iterations: i32 = super::MAX_KDF_ITERATIONS + 1;
+        let salt_ref = OctetStringRef::new(&salt).unwrap();
+        let mut buf = vec![0u8; 64];
+        let mut writer = SliceWriter::new(&mut buf);
+        writer
+            .sequence(
+                (salt_ref.encoded_len().unwrap() + iterations.encoded_len().unwrap()).unwrap(),
+                |writer| {
+                    salt_ref.encode(writer)?;
+                    iterations.encode(writer)?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let params = writer.finish().unwrap();
+        let alg_id = super::AlgorithmIdentifierOwned {
+            oid: crate::oid::PBE_WITH_SHA_AND3_KEY_TRIPLE_DES_CBC_OID,
+            parameters: Some(Any::from_der(params).unwrap()),
+        };
+
+        let result = super::decrypt(&alg_id, b"ciphertext", TEST_STORE_PASSWORD);
+
+        assert!(matches!(result, Err(Error::InvalidParameters)));
+    }
+}

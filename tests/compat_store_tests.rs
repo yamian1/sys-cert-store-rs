@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+#[cfg(scs_bundled_crypto)]
+use foreign_types_shared::ForeignType;
 use openssl::asn1::{Asn1Integer, Asn1Time};
 use openssl::bn::BigNum;
 use openssl::ec::{EcGroup, EcKey};
@@ -7,9 +9,16 @@ use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkcs12::Pkcs12;
 use openssl::pkey::{PKey, Private};
+#[cfg(scs_bundled_crypto)]
+use openssl::pkey_ctx::PkeyCtx;
 use openssl::stack::Stack;
 use openssl::x509::extension::{BasicConstraints, KeyUsage};
 use openssl::x509::{X509, X509Extension, X509NameBuilder};
+#[cfg(scs_bundled_crypto)]
+use p12_keystore::{
+    Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKey as P12PrivateKey,
+    PrivateKeyChain,
+};
 use rusqlite::Connection;
 use std::ffi::{CStr, CString};
 use std::fs;
@@ -27,6 +36,21 @@ use sys_cert_store::*;
 use tempfile::TempDir;
 
 static API_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+const PQC_ALGORITHMS: [&str; 7] = [
+    "ML-DSA-44",
+    "ML-DSA-65",
+    "ML-DSA-87",
+    "MLDSA44-ECDSA-P256-SHA256",
+    "MLDSA65-ECDSA-P256-SHA512",
+    "MLDSA65-ECDSA-P384-SHA512",
+    "MLDSA87-ECDSA-P384-SHA512",
+];
+
+#[cfg(scs_bundled_crypto)]
+unsafe extern "C" {
+    fn scs_initialize_crypto() -> bool;
+}
 
 fn api_lock() -> std::sync::MutexGuard<'static, ()> {
     API_LOCK.lock().unwrap_or_else(|error| error.into_inner())
@@ -59,6 +83,75 @@ fn wide(value: &str) -> Vec<WCHAR> {
 fn key() -> PKey<Private> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
     PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
+}
+
+#[cfg(scs_bundled_crypto)]
+fn provider_key(algorithm: &str) -> PKey<Private> {
+    let algorithm_name = CString::new(algorithm).unwrap();
+    let context = unsafe {
+        openssl_sys::EVP_PKEY_CTX_new_from_name(
+            ptr::null_mut(),
+            algorithm_name.as_ptr(),
+            ptr::null(),
+        )
+    };
+    assert!(
+        !context.is_null(),
+        "bundled provider does not advertise {algorithm}: {}",
+        openssl::error::ErrorStack::get()
+    );
+    let mut context = unsafe { PkeyCtx::<Private>::from_ptr(context) };
+    context
+        .keygen_init()
+        .unwrap_or_else(|error| panic!("cannot initialize {algorithm} key generation: {error}"));
+    context
+        .keygen()
+        .unwrap_or_else(|error| panic!("cannot generate {algorithm} key: {error}"))
+}
+
+#[cfg(scs_bundled_crypto)]
+fn pqc_certificate(key: &PKey<Private>, serial: u32, common_name: &str) -> X509 {
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    let serial = Asn1Integer::from_bn(&BigNum::from_u32(serial).unwrap()).unwrap();
+    builder.set_serial_number(&serial).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    builder.set_pubkey(key).unwrap();
+    let mut name = X509NameBuilder::new().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, common_name)
+        .unwrap();
+    let name = name.build();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    let certificate = builder.build();
+    assert!(
+        unsafe { openssl_sys::X509_sign(certificate.as_ptr(), key.as_ptr(), ptr::null()) } > 0,
+        "cannot issue {common_name}: {}",
+        openssl::error::ErrorStack::get()
+    );
+    certificate
+}
+
+#[cfg(scs_bundled_crypto)]
+fn pqc_pfx(key: &PKey<Private>, certificate: &X509, password: &str) -> Vec<u8> {
+    let certificate_der = certificate.to_der().unwrap();
+    let certificate = P12Certificate::from_der(&certificate_der).unwrap();
+    let private_key = P12PrivateKey::from_der(&key.private_key_to_pkcs8().unwrap()).unwrap();
+    let chain = PrivateKeyChain::new(
+        sys_cert_store::cert::Certificate::from_der(&certificate_der)
+            .unwrap()
+            .sha1_fingerprint(),
+        private_key,
+        vec![certificate],
+    );
+    let mut keystore = KeyStore::new();
+    keystore.add_entry("sys-cert-store-r09", KeyStoreEntry::PrivateKeyChain(chain));
+    keystore.writer(password).write().unwrap()
 }
 
 fn certificate(
@@ -1715,27 +1808,25 @@ fn certutil_commands_and_failures() {
     assert_eq!(bad.status.code(), Some(2));
 }
 
+#[cfg(not(scs_bundled_crypto))]
 #[test]
-fn pqc_algorithms_when_available_and_interop_round_trip() {
+fn system_openssl_pqc_algorithms_when_available() {
     let _guard = api_lock();
     let temp = TempDir::new().unwrap();
-    let algorithms = [
-        "ML-DSA-44",
-        "ML-DSA-65",
-        "ML-DSA-87",
-        "MLDSA44-ECDSA-P256-SHA256",
-        "MLDSA65-ECDSA-P256-SHA512",
-        "MLDSA65-ECDSA-P384-SHA512",
-        "MLDSA87-ECDSA-P384-SHA512",
-    ];
-    let listing = Command::new("openssl")
+    let Ok(listing) = Command::new("openssl")
         .args(["list", "-public-key-algorithms"])
         .output()
-        .unwrap();
-    assert!(listing.status.success());
+    else {
+        eprintln!("system OpenSSL is unavailable; optional PQC cases skipped");
+        return;
+    };
+    if !listing.status.success() {
+        eprintln!("system OpenSSL cannot list algorithms; optional PQC cases skipped");
+        return;
+    }
     let listing = String::from_utf8_lossy(&listing.stdout);
     let mut exercised = 0;
-    for algorithm in algorithms {
+    for algorithm in PQC_ALGORITHMS {
         if !listing
             .to_ascii_lowercase()
             .contains(&algorithm.to_ascii_lowercase())
@@ -1791,6 +1882,105 @@ fn pqc_algorithms_when_available_and_interop_round_trip() {
         exercised += 1;
     }
     if exercised == 0 {
-        eprintln!("PQC provider algorithms are unavailable; dynamic PQC cases skipped");
+        eprintln!("system OpenSSL PQC algorithms are unavailable; optional cases skipped");
+    }
+}
+
+#[cfg(scs_bundled_crypto)]
+#[test]
+fn bundled_provider_pqc_algorithms_and_pfx_round_trip() {
+    let _guard = api_lock();
+    assert!(
+        unsafe { scs_initialize_crypto() },
+        "cannot initialize bundled cryptographic providers"
+    );
+    let temp = TempDir::new().unwrap();
+    let password = wide("password");
+
+    for (index, algorithm) in PQC_ALGORITHMS.into_iter().enumerate() {
+        let key = provider_key(algorithm);
+        let certificate = pqc_certificate(
+            &key,
+            u32::try_from(index + 1).unwrap(),
+            &format!("R09 {algorithm}"),
+        );
+        let certificate_der = certificate.to_der().unwrap();
+        let key_der = key.private_key_to_pkcs8().unwrap();
+        let crate_certificate =
+            sys_cert_store::cert::Certificate::from_der(&certificate_der).unwrap();
+        assert!(
+            crate_certificate.self_signed().unwrap(),
+            "{algorithm} certificate verification did not use the bundled provider successfully"
+        );
+        let crate_key = sys_cert_store::key::PrivateKey::from_der(key_der).unwrap();
+        assert!(
+            crate_key.matches(&crate_certificate).unwrap(),
+            "{algorithm} private key does not match its certificate"
+        );
+
+        let pfx = pqc_pfx(&key, &certificate, "password");
+        let blob = CRYPT_DATA_BLOB {
+            cbData: pfx.len() as DWORD,
+            pbData: pfx.as_ptr().cast_mut(),
+        };
+        let store_path = temp.path().join(format!("{index}.db"));
+        {
+            let store = Store::sqlite(&store_path, 0);
+            assert_ok(unsafe {
+                SysCertImportPfxToStore(store.0, &blob, password.as_ptr(), CRYPT_EXPORTABLE)
+            });
+            assert_eq!(
+                count(&store),
+                1,
+                "{algorithm} PFX import lost its certificate"
+            );
+
+            let mut exported = CRYPT_DATA_BLOB::default();
+            assert_ok(unsafe {
+                PFXExportCertStoreEx(
+                    store.0,
+                    &mut exported,
+                    password.as_ptr(),
+                    ptr::null_mut(),
+                    EXPORT_PRIVATE_KEYS | REPORT_NO_PRIVATE_KEY,
+                )
+            });
+            let mut exported_bytes = vec![0u8; exported.cbData as usize];
+            exported.pbData = exported_bytes.as_mut_ptr();
+            assert_ok(unsafe {
+                PFXExportCertStoreEx(
+                    store.0,
+                    &mut exported,
+                    password.as_ptr(),
+                    ptr::null_mut(),
+                    EXPORT_PRIVATE_KEYS | REPORT_NO_PRIVATE_KEY,
+                )
+            });
+
+            let exported_blob = CRYPT_DATA_BLOB {
+                cbData: exported.cbData,
+                pbData: exported_bytes.as_mut_ptr(),
+            };
+            let reimported = Store::sqlite(&temp.path().join(format!("{index}-reimport.db")), 0);
+            assert_ok(unsafe {
+                SysCertImportPfxToStore(
+                    reimported.0,
+                    &exported_blob,
+                    password.as_ptr(),
+                    CRYPT_EXPORTABLE,
+                )
+            });
+            assert_eq!(
+                count(&reimported),
+                1,
+                "{algorithm} exported PFX did not re-import"
+            );
+        }
+        let reopened = Store::sqlite(&store_path, CERT_STORE_OPEN_EXISTING_FLAG);
+        assert_eq!(
+            count(&reopened),
+            1,
+            "{algorithm} certificate did not survive store reopen"
+        );
     }
 }

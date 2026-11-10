@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
 use x509_parser::prelude::{FromDer, X509Name as NativeX509Name};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 fn encoding_check(encoding: DWORD) -> Result<(), ApiError> {
     require(
@@ -56,7 +56,7 @@ unsafe fn bytes(pointer: *const BYTE, size: usize) -> Result<Vec<u8>, ApiError> 
 
 unsafe fn wide_string(pointer: LPCWSTR) -> Result<String, ApiError> {
     require(!pointer.is_null(), E_INVALIDARG, "Null wide string")?;
-    let mut units = Vec::new();
+    let mut units = Zeroizing::new(Vec::new());
     let mut cursor = pointer;
     loop {
         let value = unsafe { *cursor };
@@ -906,11 +906,11 @@ fn parse_pfx(
     )?;
     let data = blob_slice(blob)?;
     require(!data.is_empty(), E_INVALIDARG, "Empty PKCS#12 input")?;
-    let mut secret = if password.is_null() {
+    let secret = Zeroizing::new(if password.is_null() {
         String::new()
     } else {
         unsafe { wide_string(password) }?
-    };
+    });
     let keystore = KeyStore::from_pkcs12(data, &secret, Pkcs12ImportPolicy::Raw).map_err(|_| {
         ApiError::new(
             ERROR_INVALID_DATA,
@@ -978,7 +978,6 @@ fn parse_pfx(
         leaf.private_key = Some(Arc::new(key));
         result.insert(0, leaf);
     }
-    secret.zeroize();
     require(
         !result.is_empty(),
         ERROR_NOT_SUPPORTED,
@@ -1041,7 +1040,11 @@ fn export_contexts(
     Ok(contexts)
 }
 
-fn encode_pfx(handle: HCERTSTORE, secret: &str, flags: DWORD) -> Result<Vec<u8>, ApiError> {
+fn encode_pfx(
+    handle: HCERTSTORE,
+    secret: &str,
+    flags: DWORD,
+) -> Result<Zeroizing<Vec<u8>>, ApiError> {
     require(
         flags
             & !(REPORT_NO_PRIVATE_KEY
@@ -1097,10 +1100,11 @@ fn encode_pfx(handle: HCERTSTORE, secret: &str, flags: DWORD) -> Result<Vec<u8>,
             .ca(stack)
             .key_algorithm(Nid::AES_256_CBC)
             .cert_algorithm(Nid::AES_256_CBC);
-        return builder
+        let encoded = builder
             .build2(secret)
             .and_then(|pfx| pfx.to_der())
-            .map_err(ApiError::from);
+            .map_err(ApiError::from)?;
+        return Ok(Zeroizing::new(encoded));
     }
 
     let mut keystore = KeyStore::new();
@@ -1134,10 +1138,11 @@ fn encode_pfx(handle: HCERTSTORE, secret: &str, flags: DWORD) -> Result<Vec<u8>,
             );
         }
     }
-    keystore
+    let encoded = keystore
         .writer(secret)
         .write()
-        .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))
+        .map_err(|error| ApiError::new(ERROR_GEN_FAILURE, error.to_string()))?;
+    Ok(Zeroizing::new(encoded))
 }
 
 pub fn GetLastError() -> DWORD {
@@ -2702,14 +2707,12 @@ pub unsafe fn PFXExportCertStoreEx(
             ERROR_NOT_SUPPORTED,
             "PKCS#12 export parameters are unsupported",
         )?;
-        let mut secret = if password.is_null() {
+        let secret = Zeroizing::new(if password.is_null() {
             String::new()
         } else {
             unsafe { wide_string(password) }?
-        };
-        let encoded = encode_pfx(handle, &secret, flags);
-        secret.zeroize();
-        let encoded = encoded?;
+        });
+        let encoded = encode_pfx(handle, &secret, flags)?;
         let output = unsafe { &mut *pfx };
         copy_out(&encoded, output.pbData.cast(), &mut output.cbData)?;
         Ok(TRUE)

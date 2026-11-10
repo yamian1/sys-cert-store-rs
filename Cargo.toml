@@ -26,7 +26,7 @@ libc = "0.2"
 md-5 = "0.10"
 openssl = "0.10"
 openssl-sys = "0.9"
-p12-keystore = "0.3"
+p12-keystore = { path = "third_party/p12-keystore" }
 p256 = { version = "0.13", features = ["pkcs8"] }
 p384 = { version = "0.13", features = ["pkcs8"] }
 p521 = { version = "0.13", features = ["pkcs8"] }

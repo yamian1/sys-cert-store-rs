@@ -13,6 +13,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct Material {
@@ -730,7 +731,8 @@ fn create_object(
         } else {
             directory.clone()
         };
-        write_material(&key_directory.join("private-key.pem"), &key.to_pem(), false)?;
+        let pem = key.to_pem();
+        write_material(&key_directory.join("private-key.pem"), &pem, false)?;
     }
     Ok(id)
 }
@@ -780,7 +782,7 @@ pub fn load_private_key(context: &mut Context) -> Result<(), ApiError> {
     if context.private_key.is_some() || context.key_path.is_none() {
         return Ok(());
     }
-    let pem = fs::read(context.key_path.as_ref().unwrap())?;
+    let pem = Zeroizing::new(fs::read(context.key_path.as_ref().unwrap())?);
     let key = PrivateKey::from_pem(&pem)?;
     require(
         key.matches(&context.certificate)?,

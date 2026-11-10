@@ -6,7 +6,7 @@ use base64ct::{Base64, Encoding};
 use p256::pkcs8::{DecodePrivateKey, EncodePublicKey};
 use pkcs8::PrivateKeyInfo;
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 const EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
@@ -15,19 +15,17 @@ const P384: &str = "1.3.132.0.34";
 const P521: &str = "1.3.132.0.35";
 
 pub struct PrivateKey {
-    der: Vec<u8>,
+    der: Zeroizing<Vec<u8>>,
     oid: String,
     parameter_oid: Option<String>,
 }
 
-impl Drop for PrivateKey {
-    fn drop(&mut self) {
-        self.der.zeroize();
-    }
-}
-
 impl PrivateKey {
     pub fn from_der(der: Vec<u8>) -> Result<Self, ApiError> {
+        Self::from_zeroizing_der(Zeroizing::new(der))
+    }
+
+    fn from_zeroizing_der(der: Zeroizing<Vec<u8>>) -> Result<Self, ApiError> {
         let information = PrivateKeyInfo::try_from(der.as_slice())
             .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 private key"))?;
         let oid = information.algorithm.oid.to_string();
@@ -63,31 +61,36 @@ impl PrivateKey {
             .find(END)
             .map(|value| start + value)
             .ok_or_else(|| ApiError::new(ERROR_INVALID_DATA, "Truncated PKCS#8 PEM"))?;
-        let encoded = text[start..end]
-            .bytes()
-            .filter(|byte| !byte.is_ascii_whitespace())
-            .collect::<Vec<_>>();
-        let der = Base64::decode_vec(
-            std::str::from_utf8(&encoded)
-                .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 PEM"))?,
-        )
-        .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 PEM encoding"))?;
-        Self::from_der(der)
+        let encoded = Zeroizing::new(
+            text[start..end]
+                .bytes()
+                .filter(|byte| !byte.is_ascii_whitespace())
+                .collect::<Vec<_>>(),
+        );
+        let der = Zeroizing::new(
+            Base64::decode_vec(
+                std::str::from_utf8(&encoded)
+                    .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 PEM"))?,
+            )
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 PEM encoding"))?,
+        );
+        Self::from_zeroizing_der(der)
     }
 
     pub fn to_der(&self) -> &[u8] {
         &self.der
     }
 
-    pub fn to_pem(&self) -> Vec<u8> {
-        let encoded = Base64::encode_string(&self.der);
-        let mut result = String::from("-----BEGIN PRIVATE KEY-----\n");
+    pub fn to_pem(&self) -> Zeroizing<Vec<u8>> {
+        let encoded = Zeroizing::new(Base64::encode_string(&self.der));
+        let mut result = Zeroizing::new(Vec::with_capacity(encoded.len() + 64));
+        result.extend_from_slice(b"-----BEGIN PRIVATE KEY-----\n");
         for chunk in encoded.as_bytes().chunks(64) {
-            result.push_str(std::str::from_utf8(chunk).unwrap());
-            result.push('\n');
+            result.extend_from_slice(chunk);
+            result.push(b'\n');
         }
-        result.push_str("-----END PRIVATE KEY-----\n");
-        result.into_bytes()
+        result.extend_from_slice(b"-----END PRIVATE KEY-----\n");
+        result
     }
 
     pub fn oid(&self) -> &str {
