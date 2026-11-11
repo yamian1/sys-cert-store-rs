@@ -136,6 +136,9 @@ cargo build --bin certutil
 ./target/debug/certutil --help
 ```
 
+This direct Cargo build uses system OpenSSL. Use the bundled CMake build below
+for ML-DSA and composite ML-DSA PFX operations.
+
 Common operations:
 
 ```sh

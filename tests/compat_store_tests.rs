@@ -867,6 +867,160 @@ fn pfx_import_and_private_material() {
 }
 
 #[test]
+fn repeated_pfx_import_replaces_matching_certificates() {
+    let _guard = api_lock();
+    let temp = TempDir::new().unwrap();
+    let issuer_key = key();
+    let issuer = certificate(&issuer_key, 1, "Repeated PFX CA", true, None, -60, None);
+    let leaf_key = key();
+    let leaf = certificate(
+        &leaf_key,
+        2,
+        "Repeated PFX leaf",
+        false,
+        Some((&issuer, &issuer_key)),
+        -60,
+        None,
+    );
+    let mut chain = Stack::new().unwrap();
+    chain.push(issuer).unwrap();
+    let mut builder = Pkcs12::builder();
+    builder.name("repeated");
+    builder.pkey(&leaf_key);
+    builder.cert(&leaf);
+    builder.ca(chain);
+    let pfx = builder.build2("password").unwrap().to_der().unwrap();
+    let blob = CRYPT_DATA_BLOB {
+        cbData: pfx.len() as DWORD,
+        pbData: pfx.as_ptr().cast_mut(),
+    };
+    let password = wide("password");
+    let store = Store::sqlite(&temp.path().join("MY.db"), 0);
+
+    // SAFETY: the store, PFX blob, and terminated password are live.
+    assert_ok(unsafe { SysCertImportPfxToStore(store.0, &blob, password.as_ptr(), 0) });
+    assert_eq!(count(&store), 2);
+
+    let subject = wide("Repeated PFX leaf");
+    // SAFETY: the store and terminated UTF-16 subject are live.
+    let original = Context(unsafe {
+        CertFindCertificateInStore(
+            store.0,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_STR_W,
+            subject.as_ptr().cast(),
+            ptr::null(),
+        )
+    });
+    assert!(!original.0.is_null());
+    set_property(&original, CERT_FIRST_USER_PROP_ID, &[9, 8, 7]);
+
+    // SAFETY: the store, PFX blob, and terminated password are live.
+    assert_ok(unsafe { SysCertImportPfxToStore(store.0, &blob, password.as_ptr(), 0) });
+    assert_eq!(count(&store), 2);
+
+    // SAFETY: the store and terminated UTF-16 subject are live.
+    let replacement = Context(unsafe {
+        CertFindCertificateInStore(
+            store.0,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_STR_W,
+            subject.as_ptr().cast(),
+            ptr::null(),
+        )
+    });
+    assert!(!replacement.0.is_null());
+    assert_eq!(
+        property(&replacement, CERT_FIRST_USER_PROP_ID),
+        vec![9, 8, 7]
+    );
+    assert!(material_path(&replacement, TRUE).is_file());
+
+    let mut certificate_only = CRYPT_DATA_BLOB::default();
+    // SAFETY: the store, output blob, and terminated password are live.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut certificate_only,
+            password.as_ptr(),
+            ptr::null_mut(),
+            0,
+        )
+    });
+    let mut certificate_only_bytes = vec![0u8; certificate_only.cbData as usize];
+    certificate_only.pbData = certificate_only_bytes.as_mut_ptr();
+    // SAFETY: the blob describes the writable certificate-only output buffer.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut certificate_only,
+            password.as_ptr(),
+            ptr::null_mut(),
+            0,
+        )
+    });
+    let certificate_only_blob = CRYPT_DATA_BLOB {
+        cbData: certificate_only.cbData,
+        pbData: certificate_only_bytes.as_mut_ptr(),
+    };
+    // SAFETY: the store, PFX blob, and terminated password are live.
+    assert_ok(unsafe {
+        SysCertImportPfxToStore(store.0, &certificate_only_blob, password.as_ptr(), 0)
+    });
+    assert_eq!(count(&store), 2);
+
+    // SAFETY: the store and terminated UTF-16 subject are live.
+    let certificate_only_replacement = Context(unsafe {
+        CertFindCertificateInStore(
+            store.0,
+            X509_ASN_ENCODING,
+            0,
+            CERT_FIND_SUBJECT_STR_W,
+            subject.as_ptr().cast(),
+            ptr::null(),
+        )
+    });
+    assert!(!certificate_only_replacement.0.is_null());
+    assert_eq!(
+        property(&certificate_only_replacement, CERT_FIRST_USER_PROP_ID),
+        vec![9, 8, 7]
+    );
+    assert!(material_path(&certificate_only_replacement, TRUE).is_file());
+
+    let mut exported = CRYPT_DATA_BLOB::default();
+    // SAFETY: the store, output blob, and terminated password are live.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut exported,
+            password.as_ptr(),
+            ptr::null_mut(),
+            EXPORT_PRIVATE_KEYS,
+        )
+    });
+    let mut exported_bytes = vec![0u8; exported.cbData as usize];
+    exported.pbData = exported_bytes.as_mut_ptr();
+    // SAFETY: the blob describes the writable PFX output buffer.
+    assert_ok(unsafe {
+        PFXExportCertStoreEx(
+            store.0,
+            &mut exported,
+            password.as_ptr(),
+            ptr::null_mut(),
+            EXPORT_PRIVATE_KEYS,
+        )
+    });
+    let exported_material = Pkcs12::from_der(&exported_bytes)
+        .unwrap()
+        .parse2("password")
+        .unwrap();
+    assert!(exported_material.pkey.unwrap().public_eq(&leaf_key));
+    assert_eq!(exported_material.ca.unwrap().len(), 1);
+}
+
+#[test]
 fn failed_material_insertions_remove_new_objects() {
     let _guard = api_lock();
     let temp = TempDir::new().unwrap();

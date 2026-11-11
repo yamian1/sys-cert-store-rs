@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::{self, OpenOptions};
 use std::io::{IsTerminal, Write};
+use std::mem::MaybeUninit;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -748,6 +749,34 @@ impl Drop for PendingOutput {
     }
 }
 
+struct TerminalEchoGuard {
+    original: libc::termios,
+}
+
+impl TerminalEchoGuard {
+    fn disable() -> Result<Self, String> {
+        let mut original = MaybeUninit::uninit();
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let original = unsafe { original.assume_init() };
+        let mut hidden = original;
+        hidden.c_lflag &= !libc::ECHO;
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &hidden) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok(Self { original })
+    }
+}
+
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
 fn password(options: &Options, exporting: bool) -> Result<Zeroizing<String>, String> {
     let value = if let Some(value) = &options.password {
         eprintln!(
@@ -787,10 +816,14 @@ fn password(options: &Options, exporting: bool) -> Result<Zeroizing<String>, Str
         std::io::stderr()
             .flush()
             .map_err(|error| error.to_string())?;
+        let echo = TerminalEchoGuard::disable()?;
         let mut value = Zeroizing::new(String::new());
-        std::io::stdin()
+        let read = std::io::stdin()
             .read_line(&mut value)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        drop(echo);
+        eprintln!();
+        read?;
         while value.ends_with(['\r', '\n']) {
             value.pop();
         }

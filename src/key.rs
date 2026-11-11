@@ -25,6 +25,12 @@ impl PrivateKey {
         Self::from_zeroizing_der(Zeroizing::new(der))
     }
 
+    pub(crate) fn der_is_pqc(der: &[u8]) -> Result<bool, ApiError> {
+        let information = PrivateKeyInfo::try_from(der)
+            .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 private key"))?;
+        Ok(is_pqc_oid(&information.algorithm.oid.to_string()))
+    }
+
     fn from_zeroizing_der(der: Zeroizing<Vec<u8>>) -> Result<Self, ApiError> {
         let information = PrivateKeyInfo::try_from(der.as_slice())
             .map_err(|_| ApiError::new(ERROR_INVALID_DATA, "Invalid PKCS#8 private key"))?;

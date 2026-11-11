@@ -1,7 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref, non_snake_case)]
 
 use crate::api_types::*;
-use crate::cert::{Context, supported_property};
+use crate::cert::{Context, Properties, supported_property};
 use crate::crl_cache;
 use crate::error::{ApiError, boundary, last_error, message_ptr, require, set_error};
 use crate::key::PrivateKey;
@@ -854,6 +854,7 @@ fn delete_context(state: &mut State, pointer: *const CERT_CONTEXT) -> Result<(),
 
 #[allow(clippy::vec_box)]
 fn parse_pfx_openssl(data: &[u8], secret: &str) -> Result<Vec<Box<Context>>, ApiError> {
+    crate::crypto::initialize()?;
     let pfx = Pkcs12::from_der(data).map_err(|_| {
         ApiError::new(
             ERROR_INVALID_DATA,
@@ -861,10 +862,11 @@ fn parse_pfx_openssl(data: &[u8], secret: &str) -> Result<Vec<Box<Context>>, Api
         )
     })?;
     let parsed = pfx.parse2(secret).map_err(|_| {
-        ApiError::new(
-            ERROR_INVALID_DATA,
-            "PKCS#12 password or integrity check failed",
-        )
+        #[cfg(scs_bundled_crypto)]
+        let message = "Bundled provider could not decode PQC PKCS#12 material";
+        #[cfg(not(scs_bundled_crypto))]
+        let message = "PQC PKCS#12 import requires an OpenSSL provider with ML-DSA support; use the bundled CMake build";
+        ApiError::new(ERROR_NOT_SUPPORTED, message)
     })?;
     let mut result = Vec::new();
     if let Some(certificate) = parsed.cert {
@@ -925,17 +927,22 @@ fn parse_pfx(
     })?;
     let mut result = Vec::new();
     let mut private_key = None;
+    let mut private_key_seen = false;
     let mut requires_openssl = false;
     for (_, entry) in keys.entries() {
         if let KeyStoreEntry::PrivateKeyChain(chain) = entry {
-            let key = PrivateKey::from_der(chain.key().as_der().to_vec())?;
-            requires_openssl |= key.is_pqc();
             require(
-                private_key.is_none(),
+                !private_key_seen,
                 ERROR_NOT_SUPPORTED,
                 "PKCS#12 files with multiple private keys are unsupported",
             )?;
-            private_key = Some(key);
+            private_key_seen = true;
+            let der = chain.key().as_der().to_vec();
+            if PrivateKey::der_is_pqc(&der)? {
+                requires_openssl = true;
+            } else {
+                private_key = Some(PrivateKey::from_der(der)?);
+            }
         }
     }
     for (_, entry) in keystore.entries() {
@@ -986,7 +993,44 @@ fn parse_pfx(
     Ok(result)
 }
 
-fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), ApiError> {
+fn snapshot_row(
+    state: &mut State,
+    store_id: usize,
+    store: &Store,
+    row: i64,
+) -> Result<(), ApiError> {
+    let properties = read_properties(store, row)?;
+    for context in state.contexts.values_mut() {
+        if context.store_id == Some(store_id) && context.row == row {
+            context.properties = properties.clone();
+        }
+    }
+    Ok(())
+}
+
+fn import_pfx(
+    state: &mut State,
+    handle: HCERTSTORE,
+    certificates: &[Box<Context>],
+) -> Result<(), ApiError> {
+    let store_id = store_key(handle);
+    let mut store = state.stores.remove(&store_id).ok_or_else(|| {
+        ApiError::new(
+            ERROR_INVALID_HANDLE,
+            "Invalid or closed certificate store handle",
+        )
+    })?;
+    let result = import_pfx_into_store(state, store_id, &mut store, certificates);
+    state.stores.insert(store_id, store);
+    result
+}
+
+fn import_pfx_into_store(
+    state: &mut State,
+    store_id: usize,
+    store: &mut Store,
+    certificates: &[Box<Context>],
+) -> Result<(), ApiError> {
     writable(store)?;
     require(
         store.objects.is_some() && !store.native,
@@ -995,12 +1039,52 @@ fn import_pfx(store: &mut Store, certificates: &[Box<Context>]) -> Result<(), Ap
     )?;
     store.db.execute_batch("BEGIN IMMEDIATE")?;
     let mut pending = PendingObjectDirectories::new();
-    for context in certificates {
-        if let Err(error) = insert_material(store, context, &mut pending) {
-            return Err(rollback_material_transaction(store, &mut pending, error));
+    let transaction_result = (|| {
+        for context in certificates {
+            let rows = {
+                let mut statement = store
+                    .db
+                    .prepare("SELECT id FROM certificates ORDER BY id")?;
+                statement
+                    .query_map([], |record| record.get::<_, i64>(0))?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            let mut existing = Vec::new();
+            for row in rows {
+                let mut candidate = load_context(store, row)?;
+                if candidate.same_identity(context) {
+                    candidate.properties = read_properties(store, row)?;
+                    existing.push((row, candidate));
+                }
+            }
+
+            let mut properties = Properties::new();
+            let mut private_key = context.private_key.clone();
+            for (row, mut candidate) in existing {
+                for (id, value) in std::mem::take(&mut candidate.properties) {
+                    properties.entry(id).or_insert(value);
+                }
+                if private_key.is_none() {
+                    load_private_key(&mut candidate)?;
+                    private_key = candidate.private_key;
+                }
+                snapshot_row(state, store_id, store, row)?;
+                retire_row(store, row)?;
+            }
+            properties.extend(context.properties.clone());
+
+            let mut material = Context::new(context.der().to_vec())?;
+            material.private_key = private_key;
+            let row = insert_material(store, &material, &mut pending)?;
+            write_properties(store, row, &properties)?;
         }
+        Ok::<(), ApiError>(())
+    })();
+    if let Err(error) = transaction_result {
+        return Err(rollback_material_transaction(store, &mut pending, error));
     }
-    commit_material_transaction(store, pending)
+    commit_material_transaction(store, pending)?;
+    collect_garbage(store)
 }
 
 #[allow(clippy::vec_box)]
@@ -2623,18 +2707,21 @@ pub unsafe fn SysCertImportPfxToStore(
         require(!pfx.is_null(), E_INVALIDARG, "Empty PKCS#12 input")?;
         let certificates = parse_pfx(unsafe { &*pfx }, password, flags)?;
         let mut state = STATE.lock();
-        let store = state.store_mut(handle)?;
-        require(
-            flags & CRYPT_MACHINE_KEYSET == 0 || store.location == CERT_SYSTEM_STORE_LOCAL_MACHINE,
-            E_INVALIDARG,
-            "Computer keyset requires a computer-scoped destination store",
-        )?;
-        require(
-            flags & CRYPT_USER_KEYSET == 0 || store.location != CERT_SYSTEM_STORE_LOCAL_MACHINE,
-            E_INVALIDARG,
-            "User keyset cannot target a computer store",
-        )?;
-        import_pfx(store, &certificates)?;
+        {
+            let store = state.store(handle)?;
+            require(
+                flags & CRYPT_MACHINE_KEYSET == 0
+                    || store.location == CERT_SYSTEM_STORE_LOCAL_MACHINE,
+                E_INVALIDARG,
+                "Computer keyset requires a computer-scoped destination store",
+            )?;
+            require(
+                flags & CRYPT_USER_KEYSET == 0 || store.location != CERT_SYSTEM_STORE_LOCAL_MACHINE,
+                E_INVALIDARG,
+                "User keyset cannot target a computer store",
+            )?;
+        }
+        import_pfx(&mut state, handle, &certificates)?;
         Ok(TRUE)
     })
 }
@@ -2679,10 +2766,7 @@ pub unsafe fn PFXImportCertStore(
             Some(name.clone()),
             None,
         )?;
-        {
-            let store = state.store_mut(handle)?;
-            import_pfx(store, &certificates)?;
-        }
+        import_pfx(&mut state, handle, &certificates)?;
         Ok(handle)
     })
 }
