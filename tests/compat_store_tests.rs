@@ -348,6 +348,24 @@ fn count(store: &Store) -> usize {
     }
 }
 
+fn enumerated_property_values(store: &Store, id: DWORD) -> Vec<Vec<u8>> {
+    let mut values = Vec::new();
+    let mut previous = ptr::null();
+    loop {
+        // SAFETY: the store is live and `previous` is null or the preceding
+        // enumeration result, which this call consumes.
+        let current = unsafe { CertEnumCertificatesInStore(store.0, previous) };
+        if current.is_null() {
+            assert_eq!(last_error(), CRYPT_E_NOT_FOUND);
+            return values;
+        }
+        let context = Context(current);
+        values.push(property(&context, id));
+        previous = context.0;
+        std::mem::forget(context);
+    }
+}
+
 fn property(context: &Context, id: DWORD) -> Vec<u8> {
     let mut size = 0;
     // SAFETY: the context is live and null output requests the required size.
@@ -606,6 +624,50 @@ fn persistent_store_round_trip_and_static_rust_calls() {
         .is_null()
     );
     assert_eq!(last_error(), ERROR_FILE_NOT_FOUND);
+}
+
+#[test]
+fn enumeration_preserves_order_and_filters_archived_certificates() {
+    let _guard = api_lock();
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("enumeration.db");
+    let signer = key();
+    {
+        let store = Store::sqlite(&path, CERT_STORE_CREATE_NEW_FLAG);
+        for marker in 1..=3 {
+            let certificate = certificate(
+                &signer,
+                marker,
+                &format!("Enumeration {marker}"),
+                false,
+                None,
+                -60,
+                None,
+            );
+            let source = Context::from_x509(&certificate);
+            let added = Context::add(&store, &source, CERT_STORE_ADD_ALWAYS);
+            set_property(&added, CERT_FIRST_USER_PROP_ID, &[marker as u8]);
+            if marker == 2 {
+                set_property(&added, CERT_ARCHIVED_PROP_ID, &[1]);
+            }
+        }
+    }
+
+    let visible = Store::sqlite(&path, CERT_STORE_OPEN_EXISTING_FLAG);
+    assert_eq!(
+        enumerated_property_values(&visible, CERT_FIRST_USER_PROP_ID),
+        [vec![1], vec![3]]
+    );
+    drop(visible);
+
+    let including_archived = Store::sqlite(
+        &path,
+        CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_ENUM_ARCHIVED_FLAG,
+    );
+    assert_eq!(
+        enumerated_property_values(&including_archived, CERT_FIRST_USER_PROP_ID),
+        [vec![1], vec![2], vec![3]]
+    );
 }
 
 #[test]

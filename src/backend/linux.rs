@@ -459,6 +459,17 @@ fn context_matches(
     }
 }
 
+fn next_certificate_row(store: &Store, after: i64) -> Result<Option<i64>, ApiError> {
+    Ok(store
+        .db
+        .query_row(
+            "SELECT id FROM certificates WHERE id>? ORDER BY id LIMIT 1",
+            [after],
+            |record| record.get(0),
+        )
+        .optional()?)
+}
+
 fn find_certificate(
     state: &mut State,
     handle: HCERTSTORE,
@@ -546,19 +557,20 @@ fn find_certificate(
     }
     let outcome = (|| {
         for (index, source_id) in sources.iter().enumerate().skip(first) {
-            let rows = {
+            {
                 let store = state.stores.get_mut(source_id).unwrap();
                 materialize(store, false)?;
-                let mut statement = store
-                    .db
-                    .prepare("SELECT id FROM certificates WHERE id>? ORDER BY id")?;
-                statement
-                    .query_map([if index == first { after } else { 0 }], |record| {
-                        record.get::<_, i64>(0)
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            for row in rows {
+            }
+            let mut cursor = if index == first { after } else { 0 };
+            loop {
+                let row = {
+                    let store = state.stores.get(source_id).unwrap();
+                    next_certificate_row(store, cursor)?
+                };
+                let Some(row) = row else {
+                    break;
+                };
+                cursor = row;
                 let candidate = {
                     let store = state.stores.get(source_id).unwrap();
                     let mut value = load_context(store, row)?;
